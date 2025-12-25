@@ -1,0 +1,8 @@
+websocket-client>=1.6.0
+sounddevice>=0.4.6
+numpy>=1.24.0
+pynput>=1.7.6  # 键盘监听
+pyobjc>=10.0  # macOS 框架完整支持
+pyobjc-framework-Quartz>=10.0  # macOS 鼠标控制
+pyobjc-framework-ApplicationServices>=10.0  # Accessibility API
+py2app>=0.28  # 打包工具
