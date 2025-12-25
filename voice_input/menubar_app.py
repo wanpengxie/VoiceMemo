@@ -1,12 +1,16 @@
 """
 语音输入法 - 菜单栏应用
 常驻右上角，按住 Option 键录音
+
+架构说明：
+- RecordingCoordinator: 核心状态机，管理录音生命周期
+- StatusBarController: UI 控制器，处理菜单栏和状态窗口
+- 键盘监听通过 pynput 实现
 """
 
 import threading
 import logging
 import time
-import sys
 from typing import Optional
 
 from AppKit import (
@@ -22,10 +26,16 @@ from . import config
 from .settings import settings
 from .settings_window import show_settings_window
 from .log_viewer import show_log_viewer
-from .asr_client import ASRClient
-from .audio_recorder import AudioRecorder
 from .ui import type_text, set_clipboard, get_clipboard
 from .log_manager import setup_logging
+from .history import history_manager
+from .coordinator import RecordingCoordinator, CoordinatorCallbacks
+from .state_machine import State
+from .system_utils import (
+    check_accessibility_permission,
+    request_accessibility_permission,
+    ensure_single_instance
+)
 
 # 配置日志（保存到 ~/Library/Logs/VoiceInput/）
 setup_logging(level=logging.INFO)
@@ -42,83 +52,27 @@ class StatusBarController(NSObject):
 
         self.status_item = None
         self.status_window = None
-        self.is_recording = False
-        self.is_option_pressed = False
-        self._lock = threading.Lock()
-        self.current_text = ""
-        self.committed_text = ""
-        self.saved_clipboard = ""
-        self.asr_client = None
-        self.recorder = None
         self.key_listener = None
+        self.is_option_pressed = False
+        self.saved_clipboard = ""
 
-        # 计费/资源保护：避免长时间占用麦克风/ASR
-        self._idle_timer: Optional[threading.Timer] = None
-        self._recording_timeout_timer: Optional[threading.Timer] = None
-        self._last_interaction_ts = time.time()
-
-        # 会话/收尾控制（防止快速连按导致竞态）
-        self._session_id = 0
-        self._finalize_event: Optional[threading.Event] = None
-        self._finalize_wait_session_id: Optional[int] = None
-        self._stopping = False
+        # 初始化录音协调器
+        self.coordinator = RecordingCoordinator(
+            callbacks=CoordinatorCallbacks(
+                on_state_change=self._on_state_change,
+                on_ui_update=self._on_ui_update,
+                on_error=self._on_error,
+                on_text_commit=self._on_text_commit,
+                on_text_update=self._on_text_update,
+            )
+        )
+        self.coordinator.set_main_thread_callback(AppHelper.callAfter)
 
         return self
 
-    def _touch_activity(self):
-        """记录一次交互，并重置 idle 关停定时器"""
-        self._last_interaction_ts = time.time()
-        self._reset_idle_timer()
-
-    def _reset_idle_timer(self):
-        """60 秒无交互：确保彻底关麦/断开连接"""
-        try:
-            if self._idle_timer:
-                self._idle_timer.cancel()
-        except Exception:
-            pass
-
-        def on_idle():
-            AppHelper.callAfter(self._idle_shutdown_if_needed)
-
-        self._idle_timer = threading.Timer(60.0, on_idle)
-        self._idle_timer.daemon = True
-        self._idle_timer.start()
-
-    def _idle_shutdown_if_needed(self):
-        """主线程：空闲时确保资源释放"""
-        now = time.time()
-        if self.is_recording:
-            return
-        if now - self._last_interaction_ts < 60.0:
-            return
-        if self.recorder or self.asr_client:
-            logger.info("空闲 60s，自动关闭麦克风/ASR 连接")
-            self._reset()
-
-    def _cancel_recording_timeout(self):
-        try:
-            if self._recording_timeout_timer:
-                self._recording_timeout_timer.cancel()
-        except Exception:
-            pass
-        self._recording_timeout_timer = None
-
-    def _arm_recording_timeout(self, session_id: int):
-        """录音最长 60 秒，避免忘记松开 Option 导致持续计费"""
-        self._cancel_recording_timeout()
-
-        def on_timeout():
-            def stop_if_needed():
-                if self.is_recording and self._session_id == session_id:
-                    logger.warning("录音超时（60s），自动停止以避免持续计费")
-                    self.is_option_pressed = False
-                    self._stop_recording()
-            AppHelper.callAfter(stop_if_needed)
-
-        self._recording_timeout_timer = threading.Timer(60.0, on_timeout)
-        self._recording_timeout_timer.daemon = True
-        self._recording_timeout_timer.start()
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # 菜单栏设置
+    # ═══════════════════════════════════════════════════════════════════════════════
 
     def setupStatusBar(self):
         """设置菜单栏图标"""
@@ -132,6 +86,7 @@ class StatusBarController(NSObject):
 
         # 创建菜单
         menu = NSMenu.alloc().init()
+        menu.setDelegate_(self)  # 设置代理以便动态更新
 
         # 状态显示
         self.status_menu_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
@@ -139,6 +94,18 @@ class StatusBarController(NSObject):
         )
         self.status_menu_item.setEnabled_(False)
         menu.addItem_(self.status_menu_item)
+
+        menu.addItem_(NSMenuItem.separatorItem())
+
+        # 输入历史（子菜单）
+        history_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "输入历史", None, ""
+        )
+        self.history_submenu = NSMenu.alloc().init()
+        self.history_submenu.setDelegate_(self)
+        history_item.setSubmenu_(self.history_submenu)
+        menu.addItem_(history_item)
+        self._history_menu_item = history_item
 
         menu.addItem_(NSMenuItem.separatorItem())
 
@@ -165,12 +132,45 @@ class StatusBarController(NSObject):
         menu.addItem_(quit_item)
 
         self.status_item.setMenu_(menu)
+        self._main_menu = menu
 
     def setupStatusWindow(self):
         """设置状态显示窗口"""
         from .main import StatusBar
         self.status_window = StatusBar()
         self.status_window._setup_window()
+
+    def setupKeyListener(self):
+        """设置键盘监听"""
+        # 先检查辅助功能权限
+        if not check_accessibility_permission():
+            logger.warning("辅助功能权限未授权，尝试请求...")
+            request_accessibility_permission()
+            # 继续设置监听，权限授权后会自动生效
+
+        from pynput import keyboard
+
+        def on_press(key):
+            if key == keyboard.Key.alt or key == keyboard.Key.alt_l or key == keyboard.Key.alt_r:
+                if not self.is_option_pressed:
+                    self.is_option_pressed = True
+                    AppHelper.callAfter(self._on_option_press)
+
+        def on_release(key):
+            if key == keyboard.Key.alt or key == keyboard.Key.alt_l or key == keyboard.Key.alt_r:
+                if self.is_option_pressed:
+                    self.is_option_pressed = False
+                    AppHelper.callAfter(self._on_option_release)
+
+        self.key_listener = keyboard.Listener(
+            on_press=on_press,
+            on_release=on_release
+        )
+        self.key_listener.start()
+
+    def startCoordinator(self):
+        """启动录音协调器"""
+        self.coordinator.start()
 
     @objc.signature(b'v@:@')
     def openSettings_(self, sender):
@@ -182,247 +182,211 @@ class StatusBarController(NSObject):
         """打开日志查看窗口"""
         show_log_viewer()
 
-    def setupKeyListener(self):
-        """设置键盘监听"""
-        from pynput import keyboard
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # 键盘事件处理
+    # ═══════════════════════════════════════════════════════════════════════════════
 
-        def on_press(key):
-            if key == keyboard.Key.alt or key == keyboard.Key.alt_l or key == keyboard.Key.alt_r:
-                if not self.is_option_pressed:
-                    self.is_option_pressed = True
-                    AppHelper.callAfter(self._start_recording)
-
-        def on_release(key):
-            if key == keyboard.Key.alt or key == keyboard.Key.alt_l or key == keyboard.Key.alt_r:
-                if self.is_option_pressed:
-                    self.is_option_pressed = False
-                    AppHelper.callAfter(self._stop_recording)
-
-        self.key_listener = keyboard.Listener(
-            on_press=on_press,
-            on_release=on_release
-        )
-        self.key_listener.start()
-
-    def _start_recording(self):
-        """开始录音"""
-        self._touch_activity()
-        with self._lock:
-            if self.is_recording:
-                return
-            self.is_recording = True
-            self._stopping = False
-            self._session_id += 1
-            session_id = self._session_id
-
-        self.current_text = ""
-        self.committed_text = ""
+    def _on_option_press(self):
+        """Option 键按下"""
+        # 保存剪贴板内容（用于后续恢复）
         self.saved_clipboard = get_clipboard() or ""
+        self.coordinator.user_start()
+
+    def _on_option_release(self):
+        """Option 键松开"""
+        self.coordinator.user_stop()
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # Coordinator 回调
+    # ═══════════════════════════════════════════════════════════════════════════════
+
+    def _on_state_change(self, old_state: State, new_state: State):
+        """状态变化回调"""
+        logger.info(f"状态变化: {old_state.name} → {new_state.name}")
 
         # 更新菜单栏图标
-        self.status_item.button().setTitle_("🔴")
-        self.status_menu_item.setTitle_("录音中...")
-
-        # 显示状态窗口
-        if self.status_window:
-            self.status_window.show("正在连接...")
-
-        # 录音超时保护（60s）
-        self._arm_recording_timeout(session_id)
-
-        # 后台连接
-        threading.Thread(target=self._connect_and_record, daemon=True).start()
-
-    def _connect_and_record(self):
-        """连接 ASR 并录音"""
-        self.asr_client = ASRClient(
-            on_result=self._on_asr_result,
-            on_error=self._on_asr_error
-        )
-
-        success, error = self.asr_client.connect()
-        if not success:
-            logger.error(f"ASR 连接失败: {error}")
-            AppHelper.callAfter(lambda: self._update_status("连接失败"))
-            time.sleep(1)
-            AppHelper.callAfter(self._reset)
-            return
-
-        if not self.is_recording:
-            self.asr_client.close()
-            return
-
-        # 启动录音
-        self.recorder = AudioRecorder(
-            on_audio=self._on_audio_data,
-            on_error=self._on_recorder_error
-        )
-
-        success, error = self.recorder.start()
-        if not success:
-            logger.error(f"录音失败: {error}")
-            AppHelper.callAfter(lambda: self._update_status("录音失败"))
-            time.sleep(1)
-            AppHelper.callAfter(self._reset)
-            return
-
-        AppHelper.callAfter(lambda: self._update_status("请说话..."))
-
-    def _stop_recording(self):
-        """停止录音"""
-        self._touch_activity()
-        with self._lock:
-            if not self.is_recording:
-                return
-            self.is_recording = False
-            self._stopping = True
-            session_id = self._session_id
-
-        # 恢复菜单栏图标
-        self.status_item.button().setTitle_("🎤")
-        self.status_menu_item.setTitle_("按住 Option 键说话")
-
-        # 停止超时计时器
-        self._cancel_recording_timeout()
-
-        # 停止录音
-        if self.recorder:
-            self.recorder.stop()
-            self.recorder = None
-
-        # 异步收尾：避免主线程 sleep 卡顿，同时尽快断开连接避免持续计费
-        self._finalize_event = threading.Event()
-        self._finalize_wait_session_id = session_id
-
-        threading.Thread(
-            target=self._finalize_stop_and_input,
-            args=(session_id,),
-            daemon=True
-        ).start()
-
-    def _finalize_stop_and_input(self, session_id: int):
-        """
-        子线程：发送 last 包，最多等待一小段时间拿最终结果，然后关闭 ASR 并粘贴
-        """
-        try:
-            # 发送最后一包（尽量不阻塞主线程）
-            if self.asr_client:
-                try:
-                    self.asr_client.send_audio(b"", is_last=True)
-                except Exception:
-                    pass
-
-            # 等待最终结果（最多 0.8s，超时则用当前累积文本）
-            if self._finalize_event:
-                self._finalize_event.wait(timeout=0.8)
-
-            # 关闭 ASR（确保 stop 后尽快断开）
-            if self.asr_client:
-                try:
-                    self.asr_client.close()
-                except Exception:
-                    pass
-                self.asr_client = None
-
-            # 隐藏状态窗口（主线程）
+        if new_state == State.RECORDING:
+            self.status_item.button().setTitle_("🔴")
+            self.status_menu_item.setTitle_("录音中...")
             if self.status_window:
-                AppHelper.callAfter(self.status_window.hide)
+                self.status_window.show("正在录音...")
+        elif new_state == State.ARMING:
+            self.status_item.button().setTitle_("🟡")
+            self.status_menu_item.setTitle_("正在初始化...")
+            if self.status_window:
+                self.status_window.show("正在初始化...")
+        elif new_state == State.STOPPING:
+            self.status_item.button().setTitle_("🟠")
+            self.status_menu_item.setTitle_("正在处理...")
+        else:  # IDLE or ERROR
+            self.status_item.button().setTitle_("🎤")
+            self.status_menu_item.setTitle_("按住 Option 键说话")
+            if self.status_window:
+                self.status_window.hide()
 
-            # 给系统一点时间把焦点还给原 App（避免在主线程 sleep）
-            time.sleep(0.08)
-
-            # 防止用户立刻又开始下一次录音导致粘贴错会话
-            if self._session_id != session_id:
-                return
-
-            full_text = self.committed_text + self.current_text
-            if full_text:
-                AppHelper.callAfter(lambda: self._do_input(full_text))
-        finally:
-            if self._finalize_wait_session_id == session_id:
-                self._finalize_wait_session_id = None
-            self._stopping = False
-
-    def _do_input(self, text: str):
-        """输入文本"""
-        success, error = type_text(text, restore_clipboard=False)
-        if success:
-            if self.saved_clipboard:
-                threading.Timer(0.5, lambda: set_clipboard(self.saved_clipboard)).start()
+    def _on_ui_update(self, text: Optional[str]):
+        """UI 更新回调"""
+        if text is None:
+            if self.status_window:
+                self.status_window.hide()
         else:
-            logger.warning(f"输入失败: {error}")
+            if self.status_window:
+                self.status_window.update(text)
 
-    def _update_status(self, text: str):
-        """更新状态显示"""
+    def _on_error(self, message: str):
+        """错误回调"""
+        logger.error(f"录音错误: {message}")
         if self.status_window:
+            self.status_window.update(f"❌ {message}")
+            # 2 秒后自动隐藏
+            threading.Timer(2.0, lambda: AppHelper.callAfter(
+                lambda: self.status_window.hide() if self.status_window else None
+            )).start()
+
+    def _on_text_commit(self, text: str):
+        """文本提交回调"""
+        if not text:
+            return
+
+        # 保存到历史记录
+        history_manager.add(text)
+
+        # 输入文本
+        def do_input():
+            success, error = type_text(text, restore_clipboard=False)
+            if success:
+                # 延迟恢复剪贴板
+                if self.saved_clipboard:
+                    threading.Timer(0.5, lambda: set_clipboard(self.saved_clipboard)).start()
+            else:
+                logger.warning(f"输入失败: {error}")
+
+        # 给系统一点时间把焦点还给原 App
+        threading.Timer(0.08, do_input).start()
+
+    def _on_text_update(self, text: str, is_definite: bool):
+        """实时文本更新回调"""
+        if self.status_window and text:
             self.status_window.update(text)
 
-    def _reset(self):
-        """重置状态"""
-        self.is_recording = False
-        self._stopping = False
-        self._cancel_recording_timeout()
-        self.status_item.button().setTitle_("🎤")
-        self.status_menu_item.setTitle_("按住 Option 键说话")
-        if self.recorder:
-            self.recorder.stop()
-            self.recorder = None
-        if self.asr_client:
-            self.asr_client.close()
-            self.asr_client = None
-        if self.status_window:
-            self.status_window.hide()
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # 历史记录菜单
+    # ═══════════════════════════════════════════════════════════════════════════════
 
-    def _on_audio_data(self, data: bytes):
-        """音频数据回调"""
-        if self.asr_client and self.is_recording:
-            self.asr_client.send_audio(data)
+    def menuNeedsUpdate_(self, menu):
+        """NSMenuDelegate: 菜单即将显示时更新"""
+        try:
+            if hasattr(self, 'history_submenu') and menu == self.history_submenu:
+                self._updateHistoryMenu()
+        except Exception as e:
+            logger.error(f"更新菜单失败: {e}")
 
-    def _on_asr_result(self, text: str, is_definite: bool):
-        """识别结果回调"""
-        if is_definite:
-            self.committed_text += text
-            self.current_text = ""
-            display_text = self.committed_text
-        else:
-            self.current_text = text
-            display_text = self.committed_text + self.current_text
+    def _updateHistoryMenu(self):
+        """更新历史子菜单"""
+        try:
+            self.history_submenu.removeAllItems()
 
-        if display_text:
-            AppHelper.callAfter(lambda: self._update_status(display_text))
+            recent_items = history_manager.get_recent(10)
 
-        # stop 收尾阶段：一旦收到 definitive 或任意更新，就不必再继续等待
-        if self._stopping and self._finalize_wait_session_id == self._session_id:
-            if self._finalize_event and (is_definite or text):
-                self._finalize_event.set()
+            if not recent_items:
+                empty_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                    "暂无历史记录", None, ""
+                )
+                empty_item.setEnabled_(False)
+                self.history_submenu.addItem_(empty_item)
+                return
 
-    def _on_asr_error(self, error: str):
-        """ASR 错误回调"""
-        logger.error(f"ASR 错误: {error}")
+            # 添加最近 10 条
+            for i, item in enumerate(recent_items):
+                display_text = f"{item.get_time_display()}  {item.get_display_text(25)}"
+                menu_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                    display_text, "copyHistoryItem:", ""
+                )
+                menu_item.setTarget_(self)
+                menu_item.setTag_(i)  # 用 tag 存储索引
+                self.history_submenu.addItem_(menu_item)
 
-    def _on_recorder_error(self, error: str):
-        """录音错误回调"""
-        logger.error(f"录音错误: {error}")
-        AppHelper.callAfter(self._reset)
+            # 如果有更多历史
+            total_count = history_manager.count()
+            if total_count > 10:
+                self.history_submenu.addItem_(NSMenuItem.separatorItem())
+
+                more_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                    f"查看更多... ({total_count} 条)", "showAllHistory:", ""
+                )
+                more_item.setTarget_(self)
+                self.history_submenu.addItem_(more_item)
+
+        except Exception as e:
+            logger.error(f"更新历史菜单失败: {e}")
+
+    @objc.signature(b'v@:@')
+    def copyHistoryItem_(self, sender):
+        """复制历史记录项到剪贴板"""
+        try:
+            index = sender.tag()
+            item = history_manager.get_by_index(index)
+            if item:
+                set_clipboard(item.text)
+                logger.info(f"已复制历史记录: {item.get_display_text()}")
+        except Exception as e:
+            logger.error(f"复制历史记录失败: {e}")
+
+    @objc.signature(b'v@:@')
+    def showAllHistory_(self, sender):
+        """显示所有历史记录窗口"""
+        try:
+            from .history_window import show_history_window
+            show_history_window()
+        except Exception as e:
+            logger.error(f"打开历史窗口失败: {e}")
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # 清理
+    # ═══════════════════════════════════════════════════════════════════════════════
+
+    def cleanup(self):
+        """清理资源"""
+        if self.coordinator:
+            self.coordinator.stop()
+        if self.key_listener:
+            try:
+                self.key_listener.stop()
+            except Exception:
+                pass
 
 
 class MenuBarApp:
     """菜单栏应用"""
+
+    # 全局引用，防止被 GC 回收
+    _global_controller = None
+    _global_app = None
 
     def __init__(self):
         self.controller = None
 
     def run(self):
         """启动应用"""
+        # 单实例检测
+        if not ensure_single_instance():
+            logger.warning("已有另一个实例在运行")
+            print("VoiceInput 已在运行中！")
+            return
+
         # 创建应用
         app = NSApplication.sharedApplication()
         app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
 
-        # 创建控制器
+        # 创建控制器（保持全局引用，防止被 Python GC 回收导致崩溃）
         self.controller = StatusBarController.alloc().init()
+        MenuBarApp._global_controller = self.controller
+        MenuBarApp._global_app = self
+
         self.controller.setupStatusBar()
         self.controller.setupStatusWindow()
         self.controller.setupKeyListener()
+        self.controller.startCoordinator()
 
         print("=" * 50)
         print("语音输入法已启动！")
@@ -448,10 +412,60 @@ class MenuBarApp:
         AppHelper.runEventLoop()
 
 
+def _setup_exception_handling():
+    """设置全局异常处理，防止未捕获异常导致崩溃"""
+    import sys
+    import faulthandler
+
+    # 启用 faulthandler，在崩溃时输出 traceback
+    try:
+        faulthandler.enable()
+    except Exception:
+        pass
+
+    # 保存原始异常处理器
+    original_excepthook = sys.excepthook
+
+    def exception_handler(exc_type, exc_value, exc_traceback):
+        """全局异常处理"""
+        # 记录到日志
+        logger.error(
+            f"未捕获异常: {exc_type.__name__}: {exc_value}",
+            exc_info=(exc_type, exc_value, exc_traceback)
+        )
+
+        # 尝试显示错误提示（但不阻止程序继续运行）
+        try:
+            from AppKit import NSAlert, NSWarningAlertStyle
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_("程序错误")
+            alert.setInformativeText_(f"{exc_type.__name__}: {exc_value}\n\n请查看日志获取详情")
+            alert.setAlertStyle_(NSWarningAlertStyle)
+            # 不使用 runModal()，避免阻塞
+        except Exception:
+            pass
+
+        # 调用原始处理器
+        if original_excepthook:
+            original_excepthook(exc_type, exc_value, exc_traceback)
+
+    sys.excepthook = exception_handler
+
+
 def main():
     """入口"""
-    app = MenuBarApp()
-    app.run()
+    # 设置全局异常处理
+    _setup_exception_handling()
+
+    try:
+        app = MenuBarApp()
+        app.run()
+    except KeyboardInterrupt:
+        logger.info("用户中断，程序退出")
+    except Exception as e:
+        logger.error(f"程序异常退出: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
