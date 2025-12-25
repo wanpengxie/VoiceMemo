@@ -6,6 +6,7 @@
 2. 事件驱动 - 所有模块通过 post_event 投递事件
 3. 主线程执行副作用 - 确保 UI 操作在主线程
 """
+from __future__ import annotations
 
 import threading
 import logging
@@ -68,11 +69,12 @@ class RecordingCoordinator:
         self._event_thread: Optional[threading.Thread] = None
         self._running = False
 
-        # 音频管道
-        self._audio_queue = AudioQueue(max_duration_ms=500, frame_ms=100)
+        # 音频管道（增加缓存时长以应对 ARMING 初始化延迟）
+        self._audio_queue = AudioQueue(max_duration_ms=2000, frame_ms=100)
         self._audio_sender: Optional[AudioSender] = None
         self._recorder: Optional[AudioRecorder] = None
         self._asr_client: Optional[ASRClient] = None
+        self._resource_lock = threading.Lock()  # 保护 _recorder 和 _asr_client
 
         # 计时器
         self._flush_timer: Optional[threading.Timer] = None
@@ -179,10 +181,12 @@ class RecordingCoordinator:
 
     def user_start(self):
         """用户开始录音"""
+        logger.info("user_start() 被调用")
         self.post_event(Event(EventType.U_START))
 
     def user_stop(self):
         """用户停止录音"""
+        logger.info("user_stop() 被调用")
         self.post_event(Event(EventType.U_STOP))
 
     # ═══════════════════════════════════════════════════════════════════════════════
@@ -204,10 +208,12 @@ class RecordingCoordinator:
 
     def _handle_event(self, event: Event):
         """处理单个事件"""
+        logger.info(f"处理事件: {event.type.name}, 当前状态: {self._ctx.state.name}")
         with self._ctx_lock:
             old_state = self._ctx.state
             self._ctx, effects = StateMachine.handle(self._ctx, event)
             new_state = self._ctx.state
+        logger.info(f"事件处理完成: {old_state.name} → {new_state.name}, 副作用数: {len(effects)}")
 
         # 状态变化通知
         if old_state != new_state and self.callbacks.on_state_change:
@@ -303,81 +309,108 @@ class RecordingCoordinator:
 
     def _check_permissions(self):
         """检查权限"""
+        # 捕获当前 session_id，防止异步完成时 session 已变化
+        captured_session = self._ctx.session_id
+
         def check():
             # 检查辅助功能权限
             if not check_accessibility_permission():
                 logger.warning("辅助功能权限未授权")
                 request_accessibility_permission()
-                self.post_event(Event(EventType.E_ACCESSIBILITY_DENIED))
+                self.post_event(Event(EventType.E_ACCESSIBILITY_DENIED, session_id=captured_session))
                 return
 
             # 检查麦克风权限
             mic_status = check_microphone_permission()
             if mic_status == 'authorized':
-                self.post_event(Event(EventType.S_MIC_PERMISSION_OK))
+                self.post_event(Event(EventType.S_MIC_PERMISSION_OK, session_id=captured_session))
             elif mic_status == 'not_determined':
                 def on_result(granted):
                     if granted:
-                        self.post_event(Event(EventType.S_MIC_PERMISSION_OK))
+                        self.post_event(Event(EventType.S_MIC_PERMISSION_OK, session_id=captured_session))
                     else:
-                        self.post_event(Event(EventType.E_MIC_PERMISSION_DENIED))
+                        self.post_event(Event(EventType.E_MIC_PERMISSION_DENIED, session_id=captured_session))
                 request_microphone_permission(on_result)
             else:
-                self.post_event(Event(EventType.E_MIC_PERMISSION_DENIED))
+                self.post_event(Event(EventType.E_MIC_PERMISSION_DENIED, session_id=captured_session))
 
         threading.Thread(target=check, daemon=True).start()
 
     def _init_audio(self):
         """初始化音频设备"""
+        # 捕获当前 session_id，防止异步完成时 session 已变化
+        captured_session = self._ctx.session_id
+
         def init():
             try:
-                session_id = self._ctx.session_id
-                self._recorder = AudioRecorder(
-                    on_audio=lambda data: self._on_audio_data(data, session_id),
+                recorder = AudioRecorder(
+                    on_audio=lambda data: self._on_audio_data(data, captured_session),
                     on_error=self._on_recorder_error
                 )
-                success, error = self._recorder.start()
+                success, error = recorder.start()
                 if success:
-                    self.post_event(Event(EventType.S_AUDIO_READY))
+                    # 检查 session 是否还匹配，避免覆盖新会话的资源
+                    with self._resource_lock:
+                        if self._ctx.session_id == captured_session:
+                            self._recorder = recorder
+                        else:
+                            # session 已变化，释放资源
+                            logger.info(f"音频初始化完成但 session 已变化，释放资源")
+                            recorder.force_release()
+                            return
+                    self.post_event(Event(EventType.S_AUDIO_READY, session_id=captured_session))
                 else:
+                    recorder.force_release()
                     self.post_event(Event(
                         EventType.E_AUDIO_INIT_FAILED,
-                        detail=friendly_error_message(error)
+                        detail=friendly_error_message(error),
+                        session_id=captured_session
                     ))
             except Exception as e:
                 self.post_event(Event(
                     EventType.E_AUDIO_INIT_FAILED,
-                    detail=str(e)
+                    detail=str(e),
+                    session_id=captured_session
                 ))
 
         threading.Thread(target=init, daemon=True).start()
 
     def _connect_transport(self):
         """建立 ASR 连接"""
+        # 捕获当前 session_id，防止异步完成时 session 已变化
+        captured_session = self._ctx.session_id
+
         def connect():
             # 先检查网络
             if not check_network_reachable():
-                self.post_event(Event(EventType.E_NETWORK_UNAVAILABLE))
+                self.post_event(Event(EventType.E_NETWORK_UNAVAILABLE, session_id=captured_session))
                 return
 
             try:
-                session_id = self._ctx.session_id
-                self._asr_client = ASRClient(
-                    on_result=lambda text, is_def: self._on_asr_result(text, is_def, session_id),
+                asr_client = ASRClient(
+                    on_result=lambda text, is_def: self._on_asr_result(text, is_def, captured_session),
                     on_error=self._on_asr_error
                 )
-                success, error = self._asr_client.connect()
+                success, error = asr_client.connect()
                 if success:
-                    self.post_event(Event(EventType.S_TRANSPORT_CONNECTED))
+                    with self._resource_lock:
+                        self._asr_client = asr_client
+                    self.post_event(Event(EventType.S_TRANSPORT_CONNECTED, session_id=captured_session))
                 else:
+                    try:
+                        asr_client.close()
+                    except Exception:
+                        pass
                     self.post_event(Event(
                         EventType.E_TRANSPORT_ERROR,
-                        detail=friendly_error_message(error)
+                        detail=friendly_error_message(error),
+                        session_id=captured_session
                     ))
             except Exception as e:
                 self.post_event(Event(
                     EventType.E_TRANSPORT_ERROR,
-                    detail=str(e)
+                    detail=str(e),
+                    session_id=captured_session
                 ))
 
         threading.Thread(target=connect, daemon=True).start()
@@ -404,9 +437,11 @@ class RecordingCoordinator:
         """停止音频采集"""
         self._cancel_timer(self._recording_timeout_timer)
 
-        if self._recorder:
+        with self._resource_lock:
+            recorder = self._recorder
+        if recorder:
             try:
-                self._recorder.stop()
+                recorder.stop()
             except Exception as e:
                 logger.warning(f"停止录音异常: {e}")
 
@@ -418,12 +453,14 @@ class RecordingCoordinator:
             self._audio_sender.stop(flush=False)
             self._audio_sender = None
 
-        if self._asr_client:
+        with self._resource_lock:
+            asr_client = self._asr_client
+            self._asr_client = None
+        if asr_client:
             try:
-                self._asr_client.close()
+                asr_client.close()
             except Exception as e:
                 logger.warning(f"关闭 ASR 连接异常: {e}")
-            self._asr_client = None
 
         logger.info("ASR 连接已关闭")
 
@@ -432,12 +469,14 @@ class RecordingCoordinator:
         self._stop_capture()
         self._close_transport()
 
-        if self._recorder:
+        with self._resource_lock:
+            recorder = self._recorder
+            self._recorder = None
+        if recorder:
             try:
-                self._recorder.force_release()
+                recorder.force_release()
             except Exception as e:
                 logger.warning(f"释放录音资源异常: {e}")
-            self._recorder = None
 
         self._audio_queue.clear()
         logger.info("所有资源已释放")
@@ -449,9 +488,11 @@ class RecordingCoordinator:
             self._audio_sender = None
 
         # 发送 last 包
-        if self._asr_client:
+        with self._resource_lock:
+            asr_client = self._asr_client
+        if asr_client:
             try:
-                self._asr_client.send_audio(b"", is_last=True)
+                asr_client.send_audio(b"", is_last=True)
             except Exception as e:
                 logger.warning(f"发送 last 包失败: {e}")
 
@@ -474,11 +515,17 @@ class RecordingCoordinator:
 
     def _send_audio_to_asr(self, pcm: bytes) -> bool:
         """发送音频到 ASR"""
-        if not self._asr_client:
+        with self._resource_lock:
+            asr_client = self._asr_client
+        if not asr_client:
             return False
         try:
-            self._asr_client.send_audio(pcm)
-            return True
+            success = asr_client.send_audio(pcm)
+            if not success:
+                # 连接已断开，触发错误事件
+                logger.warning("发送音频失败: 连接已断开")
+                self.post_event(Event(EventType.E_TRANSPORT_ERROR, detail="连接已断开"))
+            return success
         except Exception as e:
             logger.error(f"发送音频失败: {e}")
             self.post_event(Event(EventType.E_TRANSPORT_ERROR, detail=str(e)))
@@ -559,7 +606,10 @@ class RecordingCoordinator:
         self._cancel_timer(self._idle_timer)
 
         def on_idle():
-            if self._ctx.state == State.IDLE:
+            # 在锁保护下读取状态
+            with self._ctx_lock:
+                is_idle = self._ctx.state == State.IDLE
+            if is_idle:
                 # 空闲状态下释放可能残留的资源
                 self._release_resources()
             self._reset_idle_timer()

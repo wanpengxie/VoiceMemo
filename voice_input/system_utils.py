@@ -229,12 +229,12 @@ class SystemEventListener:
         self._started = False
 
         try:
-            from Foundation import NSNotificationCenter
+            from Foundation import NSDistributedNotificationCenter
             from AppKit import NSWorkspace
 
             # 移除所有观察者
             workspace_nc = NSWorkspace.sharedWorkspace().notificationCenter()
-            distributed_nc = NSNotificationCenter.defaultCenter()
+            distributed_nc = NSDistributedNotificationCenter.defaultCenter()
 
             for observer in self._observers:
                 try:
@@ -416,6 +416,7 @@ def friendly_error_message(error: str) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _pid_file_path = None
+_pid_file_handle = None  # 保持文件句柄，防止 GC 释放锁
 
 
 def ensure_single_instance(app_name: str = "VoiceInput") -> bool:
@@ -428,7 +429,7 @@ def ensure_single_instance(app_name: str = "VoiceInput") -> bool:
     import fcntl
     from pathlib import Path
 
-    global _pid_file_path
+    global _pid_file_path, _pid_file_handle
 
     # PID 文件路径
     pid_dir = Path.home() / "Library" / "Application Support" / app_name
@@ -437,14 +438,14 @@ def ensure_single_instance(app_name: str = "VoiceInput") -> bool:
 
     try:
         # 尝试获取文件锁
-        pid_file = open(_pid_file_path, 'w')
-        fcntl.flock(pid_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _pid_file_handle = open(_pid_file_path, 'w')
+        fcntl.flock(_pid_file_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
         # 写入当前 PID
-        pid_file.write(str(os.getpid()))
-        pid_file.flush()
+        _pid_file_handle.write(str(os.getpid()))
+        _pid_file_handle.flush()
 
-        # 不关闭文件，保持锁定状态
+        # 保持 _pid_file_handle 存活，锁才不会被释放
         # 当进程退出时，锁会自动释放
 
         logger.info("单实例检测通过")

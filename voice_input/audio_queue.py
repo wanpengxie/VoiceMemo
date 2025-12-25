@@ -7,6 +7,7 @@
 3. 会话隔离 - 自动丢弃旧 session 的数据
 4. 背压控制 - 队列满时丢弃最旧数据
 """
+from __future__ import annotations
 
 from collections import deque
 from threading import Event, Lock

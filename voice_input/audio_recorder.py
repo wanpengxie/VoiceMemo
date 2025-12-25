@@ -10,6 +10,7 @@ from typing import Callable, Optional
 import numpy as np
 
 from . import config
+from .audio_device_manager import get_device_manager
 
 logger = logging.getLogger(__name__)
 
@@ -118,9 +119,46 @@ class AudioRecorder:
             import traceback
             traceback.print_exc()
 
+    def _get_available_input_devices(self) -> list:
+        """获取所有可用的输入设备列表"""
+        sd = _get_sounddevice()
+        devices = []
+        try:
+            all_devices = sd.query_devices()
+            for i, dev in enumerate(all_devices):
+                if dev.get('max_input_channels', 0) > 0:
+                    devices.append((i, dev.get('name', f'Device {i}')))
+        except Exception as e:
+            logger.warning(f"查询设备列表失败: {e}")
+        return devices
+
+    def _try_open_device(self, device_id: int = None, device_name: str = None) -> tuple[bool, str]:
+        """尝试打开指定设备"""
+        sd = _get_sounddevice()
+        try:
+            self._stream = sd.InputStream(
+                device=device_id,
+                samplerate=config.AUDIO_RATE,
+                channels=config.AUDIO_CHANNEL,
+                dtype=np.float32,
+                blocksize=self.chunk_samples,
+                callback=self._audio_callback
+            )
+            self._stream.start()
+            logger.info(f"音频录音已启动，使用设备: {device_name or device_id or '默认'}")
+            return True, ""
+        except Exception as e:
+            if self._stream:
+                try:
+                    self._stream.close()
+                except Exception:
+                    pass
+                self._stream = None
+            return False, str(e)
+
     def start(self) -> tuple[bool, str]:
         """
-        开始录音 - 增强版，带自动重试
+        开始录音 - 增强版，带自动重试和设备切换
         Returns:
             (是否成功, 错误信息)
         """
@@ -130,47 +168,91 @@ class AudioRecorder:
         self._stop_event.clear()
         self._error_count = 0
 
-        # 尝试最多 2 次（第一次失败后重置 PortAudio 再试）
+        # 先刷新设备列表，确保检测到新连接的设备
+        _reset_portaudio()
+
+        sd = _get_sounddevice()
         last_error = ""
-        for attempt in range(2):
-            try:
-                sd = _get_sounddevice()
 
-                # 先检查是否有可用的输入设备
-                try:
-                    default_input = sd.query_devices(kind='input')
-                    logger.info(f"使用音频输入设备: {default_input.get('name', 'Unknown')}")
-                except Exception as e:
-                    logger.warning(f"查询音频设备失败: {e}")
+        # 第零步：检查设备管理器是否有用户选择的设备
+        try:
+            device_manager = get_device_manager()
+            selected_device = device_manager.get_selected_device()
+            selected_id = device_manager.get_selected_device_id()
 
-                self._stream = sd.InputStream(
-                    samplerate=config.AUDIO_RATE,
-                    channels=config.AUDIO_CHANNEL,
-                    dtype=np.float32,
-                    blocksize=self.chunk_samples,
-                    callback=self._audio_callback
+            if selected_device:
+                logger.info(f"使用设备管理器选择的设备: {selected_device.name} (ID: {selected_id})")
+                success, error = self._try_open_device(
+                    device_id=selected_id,
+                    device_name=selected_device.name
                 )
-                self._stream.start()
-                logger.info("音频录音已启动")
-                return True, ""
+                if success:
+                    return True, ""
+                logger.warning(f"选定设备失败: {error}，尝试备选...")
+                last_error = error
+        except Exception as e:
+            logger.warning(f"读取设备管理器失败: {e}")
 
-            except Exception as e:
-                last_error = str(e)
-                logger.error(f"录音启动失败 (尝试 {attempt + 1}/2): {last_error}")
+        # 第一步：尝试默认设备
+        try:
+            default_input = sd.query_devices(kind='input')
+            default_name = default_input.get('name', 'Unknown')
+            logger.info(f"尝试默认音频输入设备: {default_name}")
+        except Exception as e:
+            logger.warning(f"查询默认音频设备失败: {e}")
+            default_name = "Unknown"
 
-                # 第一次失败，尝试重置 PortAudio 后重试
-                if attempt == 0:
-                    logger.info("尝试重置 PortAudio 后重试...")
-                    self._stream = None
-                    _reset_portaudio()
-                    import time
-                    time.sleep(0.1)  # 给系统一点时间
-                    continue
+        success, error = self._try_open_device(device_name=default_name)
+        if success:
+            return True, ""
+        last_error = error
+        logger.warning(f"默认设备失败: {error}")
 
-        # 两次都失败了
+        # 第二步：重置 PortAudio 后再试默认设备
+        logger.info("重置 PortAudio 后重试默认设备...")
+        _reset_portaudio()
+        import time
+        time.sleep(0.1)
+
+        success, error = self._try_open_device(device_name=default_name)
+        if success:
+            return True, ""
+        last_error = error
+        logger.warning(f"重置后默认设备仍失败: {error}")
+
+        # 第三步：按优先级尝试其他可用输入设备（优先耳机/外置）
+        logger.info("尝试切换到其他可用输入设备...")
+        try:
+            device_manager = get_device_manager()
+            device_manager.refresh_devices()
+            devices = device_manager.get_devices()  # 已按优先级排序
+            logger.info(f"可用输入设备（按优先级）: {[d.name for d in devices]}")
+
+            for device in devices:
+                logger.info(f"尝试设备: {device.name} (ID: {device.id}, 优先级: {device.priority})")
+                success, error = self._try_open_device(device_id=device.id, device_name=device.name)
+                if success:
+                    return True, ""
+                logger.warning(f"设备 {device.name} 失败: {error}")
+                last_error = error
+        except Exception as e:
+            logger.warning(f"从设备管理器获取设备失败: {e}，使用原始方法")
+            # 回退到原始方法
+            available_devices = self._get_available_input_devices()
+            logger.info(f"可用输入设备: {available_devices}")
+
+            for device_id, device_name in available_devices:
+                logger.info(f"尝试设备: {device_name} (ID: {device_id})")
+                success, error = self._try_open_device(device_id=device_id, device_name=device_name)
+                if success:
+                    return True, ""
+                logger.warning(f"设备 {device_name} 失败: {error}")
+                last_error = error
+
+        # 所有设备都失败了
         error_str = last_error
         if "PortAudio" in error_str or "portaudio" in error_str.lower() or "-9986" in error_str:
-            error = f"音频设备被占用或异常，请尝试：1) 重启应用 2) 检查其他应用是否占用麦克风"
+            error = f"所有音频设备都不可用，请检查麦克风连接或重启应用"
         elif "device" in error_str.lower():
             error = f"音频设备错误: {last_error}（请检查耳机/麦克风连接）"
         elif "permission" in error_str.lower() or "denied" in error_str.lower():

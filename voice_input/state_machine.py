@@ -6,6 +6,7 @@
 2. 纯函数式 - (state, event) → (newState, effects)
 3. 会话隔离 - 每次录音生成 session_id
 """
+from __future__ import annotations
 
 from enum import Enum, auto
 from dataclasses import dataclass, field
@@ -249,6 +250,7 @@ class StateMachine:
                 ctx.session_id = None
                 logger.info("ARMING → IDLE (用户取消)")
                 effects = [
+                    Effect(EffectType.CANCEL_ARMING_TIMEOUT),  # 取消超时定时器
                     Effect(EffectType.RELEASE_RESOURCES),
                     Effect(EffectType.UPDATE_UI, "已取消"),
                 ]
@@ -294,6 +296,18 @@ class StateMachine:
                 effects = [
                     Effect(EffectType.RELEASE_RESOURCES),
                     Effect(EffectType.SHOW_ERROR, "初始化超时，请重试"),
+                ]
+
+            elif etype == EventType.E_ACCESSIBILITY_DENIED:
+                # 辅助功能权限被拒 → ERROR
+                ctx.state = State.ERROR
+                ctx.error_message = "辅助功能权限被拒绝"
+                logger.info("ARMING → ERROR (辅助功能权限被拒)")
+                effects = [
+                    Effect(EffectType.CANCEL_ARMING_TIMEOUT),
+                    Effect(EffectType.RELEASE_RESOURCES),
+                    Effect(EffectType.SHOW_ERROR, "请在系统设置中授权辅助功能权限"),
+                    Effect(EffectType.ARM_ERROR_RECOVER, 3.0),
                 ]
 
             elif etype == EventType.E_MIC_PERMISSION_DENIED:
@@ -351,7 +365,7 @@ class StateMachine:
                 effects = [
                     Effect(EffectType.STOP_CAPTURE),
                     Effect(EffectType.FLUSH_QUEUE),
-                    Effect(EffectType.ARM_FLUSH_TIMEOUT, 1.0),  # 1 秒超时
+                    Effect(EffectType.ARM_FLUSH_TIMEOUT, 3.0),  # 3 秒超时，给 ASR 足够时间返回结果
                     Effect(EffectType.UPDATE_UI, "正在处理..."),
                 ]
 
@@ -365,6 +379,7 @@ class StateMachine:
                     Effect(EffectType.STOP_CAPTURE),
                     Effect(EffectType.CLOSE_TRANSPORT),
                     Effect(EffectType.UPDATE_UI, "音频设备变化，正在重新连接..."),
+                    Effect(EffectType.ARM_ARMING_TIMEOUT, 5.0),  # 添加超时保护
                     Effect(EffectType.INIT_AUDIO),
                     Effect(EffectType.CONNECT_TRANSPORT),
                 ]
@@ -396,6 +411,7 @@ class StateMachine:
                 ctx.state = State.STOPPING
                 logger.info("RECORDING → STOPPING (设备消失)")
                 effects = [
+                    Effect(EffectType.STOP_CAPTURE),  # 添加停止采集
                     Effect(EffectType.FLUSH_QUEUE),
                     Effect(EffectType.ARM_FLUSH_TIMEOUT, 0.5),
                     Effect(EffectType.SHOW_ERROR, "音频设备已断开"),
@@ -472,6 +488,7 @@ class StateMachine:
                 ctx.error_message = None
                 logger.info("ERROR → IDLE")
                 effects = [
+                    Effect(EffectType.CANCEL_ERROR_RECOVER),  # 取消自动恢复定时器
                     Effect(EffectType.RELEASE_RESOURCES),
                     Effect(EffectType.UPDATE_UI, None),
                 ]

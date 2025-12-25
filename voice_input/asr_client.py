@@ -186,6 +186,19 @@ class ASRClient:
     def _on_error(self, ws, error):
         """WebSocket 错误回调"""
         error_str = str(error)
+
+        # 检查是否是正常的关闭帧（WebSocket close frame 有时会触发 on_error）
+        # opcode=8 是 close frame，status 1000 (0x03e8) 是正常关闭
+        # "finish last sequence" 表示 ASR 正常完成
+        if "finish last sequence" in error_str.lower():
+            logger.info(f"[{self.connect_id}] ASR 正常结束: {error_str}")
+            return  # 不报告为错误
+
+        # 检查是否是 close frame 格式的 "错误"
+        if "opcode=8" in error_str and ("\\x03\\xe8" in error_str or "1000" in error_str):
+            logger.info(f"[{self.connect_id}] WebSocket 正常关闭: {error_str}")
+            return  # 不报告为错误
+
         logger.error(f"[{self.connect_id}] WebSocket 错误: {error_str}")
         self._connect_error = error_str
         self.on_error(error_str)
@@ -193,8 +206,19 @@ class ASRClient:
     def _on_close(self, ws, close_status_code, close_msg):
         """WebSocket 关闭回调"""
         logger.info(f"[{self.connect_id}] 连接关闭: {close_status_code} - {close_msg}")
+        was_connected = self._connected.is_set()
         self._connected.clear()
         self._closed.set()
+
+        # 正常关闭（code 1000 或 "finish last sequence"）不视为错误
+        is_normal_close = (
+            close_status_code == 1000 or
+            (close_msg and "finish last sequence" in str(close_msg).lower())
+        )
+
+        # 只有非正常关闭才通知上层
+        if was_connected and not is_normal_close:
+            self.on_error(f"连接异常断开: {close_status_code} - {close_msg}")
 
     def _on_open(self, ws):
         """WebSocket 连接成功回调"""

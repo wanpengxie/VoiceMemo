@@ -36,6 +36,7 @@ from .system_utils import (
     request_accessibility_permission,
     ensure_single_instance
 )
+from .audio_device_manager import get_device_manager
 
 # 配置日志（保存到 ~/Library/Logs/VoiceInput/）
 setup_logging(level=logging.INFO)
@@ -97,6 +98,18 @@ class StatusBarController(NSObject):
 
         menu.addItem_(NSMenuItem.separatorItem())
 
+        # 音频设备选择（子菜单）
+        device_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "音频输入设备", None, ""
+        )
+        self.device_submenu = NSMenu.alloc().init()
+        self.device_submenu.setDelegate_(self)
+        device_item.setSubmenu_(self.device_submenu)
+        menu.addItem_(device_item)
+        self._device_menu_item = device_item
+
+        menu.addItem_(NSMenuItem.separatorItem())
+
         # 输入历史（子菜单）
         history_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             "输入历史", None, ""
@@ -143,7 +156,9 @@ class StatusBarController(NSObject):
     def setupKeyListener(self):
         """设置键盘监听"""
         # 先检查辅助功能权限
-        if not check_accessibility_permission():
+        has_permission = check_accessibility_permission()
+        logger.info(f"辅助功能权限检测: {has_permission}")
+        if not has_permission:
             logger.warning("辅助功能权限未授权，尝试请求...")
             request_accessibility_permission()
             # 继续设置监听，权限授权后会自动生效
@@ -151,25 +166,41 @@ class StatusBarController(NSObject):
         from pynput import keyboard
 
         def on_press(key):
-            if key == keyboard.Key.alt or key == keyboard.Key.alt_l or key == keyboard.Key.alt_r:
-                if not self.is_option_pressed:
-                    self.is_option_pressed = True
-                    AppHelper.callAfter(self._on_option_press)
+            try:
+                if key == keyboard.Key.alt or key == keyboard.Key.alt_l or key == keyboard.Key.alt_r:
+                    if not self.is_option_pressed:
+                        self.is_option_pressed = True
+                        logger.info("pynput: Option 键按下")
+                        AppHelper.callAfter(self._on_option_press)
+            except Exception as e:
+                logger.error(f"on_press 异常: {e}")
 
         def on_release(key):
-            if key == keyboard.Key.alt or key == keyboard.Key.alt_l or key == keyboard.Key.alt_r:
-                if self.is_option_pressed:
-                    self.is_option_pressed = False
-                    AppHelper.callAfter(self._on_option_release)
+            try:
+                if key == keyboard.Key.alt or key == keyboard.Key.alt_l or key == keyboard.Key.alt_r:
+                    if self.is_option_pressed:
+                        self.is_option_pressed = False
+                        logger.info("pynput: Option 键松开")
+                        AppHelper.callAfter(self._on_option_release)
+            except Exception as e:
+                logger.error(f"on_release 异常: {e}")
 
         self.key_listener = keyboard.Listener(
             on_press=on_press,
             on_release=on_release
         )
         self.key_listener.start()
+        logger.info(f"键盘监听器已启动: {self.key_listener.is_alive()}")
 
     def startCoordinator(self):
         """启动录音协调器"""
+        # 初始化设备管理器
+        # 注意：后台轮询只是补充，主要依赖系统事件通知设备变化
+        # 打开菜单时会强制刷新 PortAudio 以获取最新设备列表
+        device_manager = get_device_manager()
+        device_manager.refresh_devices(force_refresh=True)
+        device_manager.start_polling(interval=10.0)  # 低频轮询，避免干扰录音
+
         self.coordinator.start()
 
     @objc.signature(b'v@:@')
@@ -188,12 +219,14 @@ class StatusBarController(NSObject):
 
     def _on_option_press(self):
         """Option 键按下"""
+        logger.info("_on_option_press 被调用")
         # 保存剪贴板内容（用于后续恢复）
         self.saved_clipboard = get_clipboard() or ""
         self.coordinator.user_start()
 
     def _on_option_release(self):
         """Option 键松开"""
+        logger.info("_on_option_release 被调用")
         self.coordinator.user_stop()
 
     # ═══════════════════════════════════════════════════════════════════════════════
@@ -239,9 +272,11 @@ class StatusBarController(NSObject):
         if self.status_window:
             self.status_window.update(f"❌ {message}")
             # 2 秒后自动隐藏
-            threading.Timer(2.0, lambda: AppHelper.callAfter(
+            timer = threading.Timer(2.0, lambda: AppHelper.callAfter(
                 lambda: self.status_window.hide() if self.status_window else None
-            )).start()
+            ))
+            timer.daemon = True
+            timer.start()
 
     def _on_text_commit(self, text: str):
         """文本提交回调"""
@@ -257,12 +292,16 @@ class StatusBarController(NSObject):
             if success:
                 # 延迟恢复剪贴板
                 if self.saved_clipboard:
-                    threading.Timer(0.5, lambda: set_clipboard(self.saved_clipboard)).start()
+                    timer = threading.Timer(0.5, lambda: set_clipboard(self.saved_clipboard))
+                    timer.daemon = True
+                    timer.start()
             else:
                 logger.warning(f"输入失败: {error}")
 
         # 给系统一点时间把焦点还给原 App
-        threading.Timer(0.08, do_input).start()
+        timer = threading.Timer(0.08, do_input)
+        timer.daemon = True
+        timer.start()
 
     def _on_text_update(self, text: str, is_definite: bool):
         """实时文本更新回调"""
@@ -278,6 +317,8 @@ class StatusBarController(NSObject):
         try:
             if hasattr(self, 'history_submenu') and menu == self.history_submenu:
                 self._updateHistoryMenu()
+            elif hasattr(self, 'device_submenu') and menu == self.device_submenu:
+                self._updateDeviceMenu()
         except Exception as e:
             logger.error(f"更新菜单失败: {e}")
 
@@ -342,11 +383,115 @@ class StatusBarController(NSObject):
             logger.error(f"打开历史窗口失败: {e}")
 
     # ═══════════════════════════════════════════════════════════════════════════════
+    # 音频设备菜单
+    # ═══════════════════════════════════════════════════════════════════════════════
+
+    def _updateDeviceMenu(self):
+        """更新设备子菜单"""
+        try:
+            self.device_submenu.removeAllItems()
+
+            device_manager = get_device_manager()
+            # 强制刷新设备列表（菜单打开时不会录音，可以安全刷新 PortAudio）
+            device_manager.refresh_devices(force_refresh=True)
+            devices = device_manager.get_devices()
+
+            if not devices:
+                empty_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                    "未检测到音频输入设备", None, ""
+                )
+                empty_item.setEnabled_(False)
+                self.device_submenu.addItem_(empty_item)
+                return
+
+            # 自动选择选项
+            auto_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "自动（优先耳机/外置）", "selectDevice:", ""
+            )
+            auto_item.setTarget_(self)
+            auto_item.setTag_(-1)  # -1 表示自动选择
+            if device_manager.is_auto_select():
+                auto_item.setState_(1)  # NSOnState = 1
+            self.device_submenu.addItem_(auto_item)
+
+            self.device_submenu.addItem_(NSMenuItem.separatorItem())
+
+            # 设备列表
+            selected_device = device_manager.get_selected_device()
+            for device in devices:
+                # 显示名称和优先级标记
+                display_name = device.name
+                if device.priority >= 100:
+                    display_name = f"🎧 {display_name}"
+                elif device.is_default:
+                    display_name = f"● {display_name}"
+
+                menu_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                    display_name, "selectDevice:", ""
+                )
+                menu_item.setTarget_(self)
+                menu_item.setTag_(device.id)
+
+                # 标记当前选中的设备（非自动模式时）
+                if not device_manager.is_auto_select() and selected_device and device.id == selected_device.id:
+                    menu_item.setState_(1)  # NSOnState
+
+                self.device_submenu.addItem_(menu_item)
+
+            # 刷新按钮
+            self.device_submenu.addItem_(NSMenuItem.separatorItem())
+            refresh_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "刷新设备列表", "refreshDevices:", ""
+            )
+            refresh_item.setTarget_(self)
+            self.device_submenu.addItem_(refresh_item)
+
+        except Exception as e:
+            logger.error(f"更新设备菜单失败: {e}")
+
+    @objc.signature(b'v@:@')
+    def selectDevice_(self, sender):
+        """选择音频设备"""
+        try:
+            device_id = sender.tag()
+            device_manager = get_device_manager()
+
+            if device_id == -1:
+                # 自动选择
+                device_manager.select_device(None)
+                logger.info("已切换到自动设备选择模式")
+            else:
+                device_manager.select_device(device_id)
+                device = device_manager.get_device_by_id(device_id)
+                if device:
+                    logger.info(f"已选择设备: {device.name}")
+        except Exception as e:
+            logger.error(f"选择设备失败: {e}")
+
+    @objc.signature(b'v@:@')
+    def refreshDevices_(self, sender):
+        """手动刷新设备列表"""
+        try:
+            device_manager = get_device_manager()
+            # 强制刷新（用户主动点击时可以安全刷新）
+            devices = device_manager.refresh_devices(force_refresh=True)
+            logger.info(f"已刷新设备列表，共 {len(devices)} 个设备: {[d.name for d in devices]}")
+        except Exception as e:
+            logger.error(f"刷新设备列表失败: {e}")
+
+    # ═══════════════════════════════════════════════════════════════════════════════
     # 清理
     # ═══════════════════════════════════════════════════════════════════════════════
 
     def cleanup(self):
         """清理资源"""
+        # 停止设备轮询
+        try:
+            device_manager = get_device_manager()
+            device_manager.stop_polling()
+        except Exception:
+            pass
+
         if self.coordinator:
             self.coordinator.stop()
         if self.key_listener:
