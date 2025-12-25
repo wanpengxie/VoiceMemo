@@ -21,15 +21,14 @@ import objc
 from . import config
 from .settings import settings
 from .settings_window import show_settings_window
+from .log_viewer import show_log_viewer
 from .asr_client import ASRClient
 from .audio_recorder import AudioRecorder
 from .ui import type_text, set_clipboard, get_clipboard
+from .log_manager import setup_logging
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
-)
+# 配置日志（保存到 ~/Library/Logs/VoiceInput/）
+setup_logging(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -53,7 +52,73 @@ class StatusBarController(NSObject):
         self.recorder = None
         self.key_listener = None
 
+        # 计费/资源保护：避免长时间占用麦克风/ASR
+        self._idle_timer: Optional[threading.Timer] = None
+        self._recording_timeout_timer: Optional[threading.Timer] = None
+        self._last_interaction_ts = time.time()
+
+        # 会话/收尾控制（防止快速连按导致竞态）
+        self._session_id = 0
+        self._finalize_event: Optional[threading.Event] = None
+        self._finalize_wait_session_id: Optional[int] = None
+        self._stopping = False
+
         return self
+
+    def _touch_activity(self):
+        """记录一次交互，并重置 idle 关停定时器"""
+        self._last_interaction_ts = time.time()
+        self._reset_idle_timer()
+
+    def _reset_idle_timer(self):
+        """60 秒无交互：确保彻底关麦/断开连接"""
+        try:
+            if self._idle_timer:
+                self._idle_timer.cancel()
+        except Exception:
+            pass
+
+        def on_idle():
+            AppHelper.callAfter(self._idle_shutdown_if_needed)
+
+        self._idle_timer = threading.Timer(60.0, on_idle)
+        self._idle_timer.daemon = True
+        self._idle_timer.start()
+
+    def _idle_shutdown_if_needed(self):
+        """主线程：空闲时确保资源释放"""
+        now = time.time()
+        if self.is_recording:
+            return
+        if now - self._last_interaction_ts < 60.0:
+            return
+        if self.recorder or self.asr_client:
+            logger.info("空闲 60s，自动关闭麦克风/ASR 连接")
+            self._reset()
+
+    def _cancel_recording_timeout(self):
+        try:
+            if self._recording_timeout_timer:
+                self._recording_timeout_timer.cancel()
+        except Exception:
+            pass
+        self._recording_timeout_timer = None
+
+    def _arm_recording_timeout(self, session_id: int):
+        """录音最长 60 秒，避免忘记松开 Option 导致持续计费"""
+        self._cancel_recording_timeout()
+
+        def on_timeout():
+            def stop_if_needed():
+                if self.is_recording and self._session_id == session_id:
+                    logger.warning("录音超时（60s），自动停止以避免持续计费")
+                    self.is_option_pressed = False
+                    self._stop_recording()
+            AppHelper.callAfter(stop_if_needed)
+
+        self._recording_timeout_timer = threading.Timer(60.0, on_timeout)
+        self._recording_timeout_timer.daemon = True
+        self._recording_timeout_timer.start()
 
     def setupStatusBar(self):
         """设置菜单栏图标"""
@@ -84,6 +149,13 @@ class StatusBarController(NSObject):
         settings_item.setTarget_(self)
         menu.addItem_(settings_item)
 
+        # 查看日志
+        log_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "查看日志...", "openLogViewer:", "l"
+        )
+        log_item.setTarget_(self)
+        menu.addItem_(log_item)
+
         menu.addItem_(NSMenuItem.separatorItem())
 
         # 退出
@@ -104,6 +176,11 @@ class StatusBarController(NSObject):
     def openSettings_(self, sender):
         """打开设置窗口"""
         show_settings_window()
+
+    @objc.signature(b'v@:@')
+    def openLogViewer_(self, sender):
+        """打开日志查看窗口"""
+        show_log_viewer()
 
     def setupKeyListener(self):
         """设置键盘监听"""
@@ -129,10 +206,14 @@ class StatusBarController(NSObject):
 
     def _start_recording(self):
         """开始录音"""
+        self._touch_activity()
         with self._lock:
             if self.is_recording:
                 return
             self.is_recording = True
+            self._stopping = False
+            self._session_id += 1
+            session_id = self._session_id
 
         self.current_text = ""
         self.committed_text = ""
@@ -145,6 +226,9 @@ class StatusBarController(NSObject):
         # 显示状态窗口
         if self.status_window:
             self.status_window.show("正在连接...")
+
+        # 录音超时保护（60s）
+        self._arm_recording_timeout(session_id)
 
         # 后台连接
         threading.Thread(target=self._connect_and_record, daemon=True).start()
@@ -186,43 +270,78 @@ class StatusBarController(NSObject):
 
     def _stop_recording(self):
         """停止录音"""
+        self._touch_activity()
         with self._lock:
             if not self.is_recording:
                 return
             self.is_recording = False
+            self._stopping = True
+            session_id = self._session_id
 
         # 恢复菜单栏图标
         self.status_item.button().setTitle_("🎤")
         self.status_menu_item.setTitle_("按住 Option 键说话")
+
+        # 停止超时计时器
+        self._cancel_recording_timeout()
 
         # 停止录音
         if self.recorder:
             self.recorder.stop()
             self.recorder = None
 
-        # 发送最后一包
-        if self.asr_client:
-            self.asr_client.send_audio(b'', is_last=True)
+        # 异步收尾：避免主线程 sleep 卡顿，同时尽快断开连接避免持续计费
+        self._finalize_event = threading.Event()
+        self._finalize_wait_session_id = session_id
 
-        # 等待最后结果
-        time.sleep(0.3)
+        threading.Thread(
+            target=self._finalize_stop_and_input,
+            args=(session_id,),
+            daemon=True
+        ).start()
 
-        # 关闭 ASR
-        if self.asr_client:
-            self.asr_client.close()
-            self.asr_client = None
+    def _finalize_stop_and_input(self, session_id: int):
+        """
+        子线程：发送 last 包，最多等待一小段时间拿最终结果，然后关闭 ASR 并粘贴
+        """
+        try:
+            # 发送最后一包（尽量不阻塞主线程）
+            if self.asr_client:
+                try:
+                    self.asr_client.send_audio(b"", is_last=True)
+                except Exception:
+                    pass
 
-        # 隐藏状态窗口
-        if self.status_window:
-            self.status_window.hide()
+            # 等待最终结果（最多 0.8s，超时则用当前累积文本）
+            if self._finalize_event:
+                self._finalize_event.wait(timeout=0.8)
 
-        # 等待焦点回到原应用
-        time.sleep(0.15)
+            # 关闭 ASR（确保 stop 后尽快断开）
+            if self.asr_client:
+                try:
+                    self.asr_client.close()
+                except Exception:
+                    pass
+                self.asr_client = None
 
-        # 输入文本
-        full_text = self.committed_text + self.current_text
-        if full_text:
-            self._do_input(full_text)
+            # 隐藏状态窗口（主线程）
+            if self.status_window:
+                AppHelper.callAfter(self.status_window.hide)
+
+            # 给系统一点时间把焦点还给原 App（避免在主线程 sleep）
+            time.sleep(0.08)
+
+            # 防止用户立刻又开始下一次录音导致粘贴错会话
+            if self._session_id != session_id:
+                return
+
+            full_text = self.committed_text + self.current_text
+            if full_text:
+                AppHelper.callAfter(lambda: self._do_input(full_text))
+        finally:
+            if self._finalize_wait_session_id == session_id:
+                self._finalize_wait_session_id = None
+            self._stopping = False
 
     def _do_input(self, text: str):
         """输入文本"""
@@ -241,6 +360,8 @@ class StatusBarController(NSObject):
     def _reset(self):
         """重置状态"""
         self.is_recording = False
+        self._stopping = False
+        self._cancel_recording_timeout()
         self.status_item.button().setTitle_("🎤")
         self.status_menu_item.setTitle_("按住 Option 键说话")
         if self.recorder:
@@ -269,6 +390,11 @@ class StatusBarController(NSObject):
 
         if display_text:
             AppHelper.callAfter(lambda: self._update_status(display_text))
+
+        # stop 收尾阶段：一旦收到 definitive 或任意更新，就不必再继续等待
+        if self._stopping and self._finalize_wait_session_id == self._session_id:
+            if self._finalize_event and (is_definite or text):
+                self._finalize_event.set()
 
     def _on_asr_error(self, error: str):
         """ASR 错误回调"""

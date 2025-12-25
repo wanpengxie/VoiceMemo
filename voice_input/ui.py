@@ -4,36 +4,33 @@ UI 工具模块
 - 模拟键盘输入
 """
 
-import subprocess
 import logging
-from typing import Tuple
+import os
+import sys
+
+from .log_manager import write_debug_log as _write_log
 
 logger = logging.getLogger(__name__)
 
 
 def get_clipboard() -> str:
-    """获取剪贴板内容"""
+    """获取剪贴板内容（使用 NSPasteboard）"""
     try:
-        result = subprocess.run(
-            ['pbpaste'],
-            capture_output=True,
-            text=True
-        )
-        return result.stdout
+        from AppKit import NSPasteboard, NSStringPboardType
+        pb = NSPasteboard.generalPasteboard()
+        return pb.stringForType_(NSStringPboardType) or ""
     except Exception as e:
         logger.warning(f"读取剪贴板失败: {e}")
         return ""
 
 
 def set_clipboard(text: str) -> bool:
-    """设置剪贴板内容"""
+    """设置剪贴板内容（使用 NSPasteboard）"""
     try:
-        process = subprocess.Popen(
-            ['pbcopy'],
-            stdin=subprocess.PIPE
-        )
-        process.communicate(text.encode('utf-8'))
-        return process.returncode == 0
+        from AppKit import NSPasteboard, NSStringPboardType
+        pb = NSPasteboard.generalPasteboard()
+        pb.clearContents()
+        return pb.setString_forType_(text, NSStringPboardType)
     except Exception as e:
         logger.error(f"设置剪贴板失败: {e}")
         return False
@@ -41,23 +38,40 @@ def set_clipboard(text: str) -> bool:
 
 def type_text(text: str, restore_clipboard: bool = True) -> tuple[bool, str]:
     """
-    使用剪贴板 + Cmd+V 输入文本
-
-    Args:
-        text: 要输入的文本
-        restore_clipboard: 是否恢复剪贴板原内容
-
-    Returns:
-        (是否成功, 错误信息)
+    使用 NSPasteboard + CGEvent 模拟 Cmd+V 输入文本
     """
+    _write_log("=" * 50)
+    _write_log(f"[ENV] LANG={os.environ.get('LANG', '(未设置)')}")
+    _write_log(f"[ENV] sys.executable={sys.executable}")
+
     old_clipboard = ""
     if restore_clipboard:
         old_clipboard = get_clipboard()
 
     try:
-        if not set_clipboard(text):
-            return False, "设置剪贴板失败"
+        _write_log(f"[type_text] 输入文本: {text}")
 
+        # 1. 使用 NSPasteboard 设置剪贴板
+        _write_log("[clipboard] 使用 NSPasteboard...")
+        from AppKit import NSPasteboard, NSStringPboardType
+        pb = NSPasteboard.generalPasteboard()
+        pb.clearContents()
+        result = pb.setString_forType_(text, NSStringPboardType)
+        _write_log(f"[clipboard] setString 返回: {result}")
+
+        # 验证
+        content = pb.stringForType_(NSStringPboardType)
+        _write_log(f"[clipboard] 验证: {content}")
+
+        if not content:
+            _write_log("[clipboard] 剪贴板设置失败!")
+            return False, "剪贴板设置失败"
+
+        import time
+        time.sleep(0.05)
+
+        # 2. 使用 CGEvent 模拟 Cmd+V
+        _write_log("[CGEvent] 开始...")
         from Quartz import (
             CGEventCreateKeyboardEvent,
             CGEventPost,
@@ -65,15 +79,20 @@ def type_text(text: str, restore_clipboard: bool = True) -> tuple[bool, str]:
             kCGHIDEventTap,
             kCGEventFlagMaskCommand,
         )
-        import time
 
-        # V 键的 keycode 是 9
-        v_keycode = 9
+        v_keycode = 9  # V 键
 
         # 按下 Cmd+V
         event = CGEventCreateKeyboardEvent(None, v_keycode, True)
+        _write_log(f"[CGEvent] event created: {event}")
+
+        if event is None:
+            _write_log("[CGEvent] 创建事件失败!")
+            return False, "无法创建键盘事件"
+
         CGEventSetFlags(event, kCGEventFlagMaskCommand)
         CGEventPost(kCGHIDEventTap, event)
+        _write_log("[CGEvent] key down posted")
 
         time.sleep(0.05)
 
@@ -81,10 +100,15 @@ def type_text(text: str, restore_clipboard: bool = True) -> tuple[bool, str]:
         event = CGEventCreateKeyboardEvent(None, v_keycode, False)
         CGEventSetFlags(event, kCGEventFlagMaskCommand)
         CGEventPost(kCGHIDEventTap, event)
+        _write_log("[CGEvent] key up posted")
 
+        _write_log("[type_text] 完成")
         return True, ""
 
     except Exception as e:
+        _write_log(f"[type_text] 异常: {e}")
+        import traceback
+        _write_log(traceback.format_exc())
         return False, str(e)
 
     finally:

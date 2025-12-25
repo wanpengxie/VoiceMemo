@@ -51,7 +51,7 @@ OPTIONS = {
         'scipy',
         'pandas',
     ],
-    'iconfile': None,  # 可选：指定应用图标 .icns 文件
+    'iconfile': 'VoiceInput.icns',
 }
 
 setup(

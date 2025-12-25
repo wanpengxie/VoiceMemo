@@ -14,11 +14,6 @@ from .asr_client import ASRClient
 from .audio_recorder import AudioRecorder
 from .ui import type_text, set_clipboard, get_clipboard
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
-)
 logger = logging.getLogger(__name__)
 
 
