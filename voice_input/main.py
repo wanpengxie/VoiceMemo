@@ -506,29 +506,65 @@ class StatusBar:
                         logger.info(f"[定位] 使用主屏幕中央")
 
             # ═══════════════════════════════════════════════════════════════
-            # 边界检查：确保不超出屏幕
+            # 边界检查：确保不超出屏幕（支持多显示器）
             # ═══════════════════════════════════════════════════════════════
-            screen = NSScreen.mainScreen()
-            screen_frame = screen.frame()
+
+            # 找到窗口中心点所在的屏幕
+            from AppKit import NSPoint, NSMakePoint
+            center_point = NSMakePoint(x + window_width / 2, y + window_height / 2)
+
+            # 遍历所有屏幕，找到包含该点的屏幕
+            target_screen = None
+            for screen in NSScreen.screens():
+                if screen.frame().origin.x <= center_point.x <= screen.frame().origin.x + screen.frame().size.width:
+                    if screen.frame().origin.y <= center_point.y <= screen.frame().origin.y + screen.frame().size.height:
+                        target_screen = screen
+                        break
+
+            # 如果没找到（可能在屏幕边缘），使用光标位置找屏幕
+            if target_screen is None and caret_pos:
+                caret_point = NSMakePoint(caret_pos[0], caret_pos[1])
+                for screen in NSScreen.screens():
+                    sf = screen.frame()
+                    if sf.origin.x <= caret_point.x <= sf.origin.x + sf.size.width:
+                        if sf.origin.y <= caret_point.y <= sf.origin.y + sf.size.height:
+                            target_screen = screen
+                            break
+
+            # 最终 fallback 到主屏幕
+            if target_screen is None:
+                target_screen = NSScreen.mainScreen()
+
+            screen_frame = target_screen.frame()
+            # 屏幕的实际边界（考虑屏幕位置偏移）
+            screen_min_x = screen_frame.origin.x
+            screen_max_x = screen_frame.origin.x + screen_frame.size.width
+            screen_min_y = screen_frame.origin.y
+            screen_max_y = screen_frame.origin.y + screen_frame.size.height
+
+            logger.info(f"[定位] 目标屏幕: origin=({screen_frame.origin.x}, {screen_frame.origin.y}), "
+                       f"size=({screen_frame.size.width}, {screen_frame.size.height})")
 
             # 右边界
-            if x + window_width > screen_frame.size.width:
-                x = screen_frame.size.width - window_width - 8
+            if x + window_width > screen_max_x:
+                x = screen_max_x - window_width - 8
 
             # 左边界
-            if x < 8:
-                x = 8
+            if x < screen_min_x + 8:
+                x = screen_min_x + 8
 
             # 下边界：如果下方空间不够，改为显示在光标上方
-            if y < 8:
+            if y < screen_min_y + 8:
                 if use_caret and caret_pos:
                     y = caret_pos[1] + caret_pos[3] + 4  # 光标上方
                 else:
-                    y = 8
+                    y = screen_min_y + 8
 
             # 上边界
-            if y + window_height > screen_frame.size.height:
-                y = screen_frame.size.height - window_height - 8
+            if y + window_height > screen_max_y:
+                y = screen_max_y - window_height - 8
+
+            logger.info(f"[定位] 最终位置: ({x}, {y})")
 
             # 移动窗口
             self.window.setFrameOrigin_((x, y))
