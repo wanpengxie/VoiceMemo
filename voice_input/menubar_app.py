@@ -153,8 +153,11 @@ class StatusBarController(NSObject):
     def setupStatusWindow(self):
         """设置状态显示窗口"""
         from .main import StatusBar
+        logger.info("[调试] setupStatusWindow 开始")
         self.status_window = StatusBar()
+        logger.info(f"[调试] StatusBar 实例化完成: {self.status_window is not None}")
         self.status_window._setup_window()
+        logger.info(f"[调试] _setup_window 完成, window={self.status_window.window is not None}")
 
     def setupKeyListener(self):
         """设置键盘监听"""
@@ -238,19 +241,29 @@ class StatusBarController(NSObject):
 
     def _on_state_change(self, old_state: State, new_state: State):
         """状态变化回调"""
-        logger.info(f"状态变化: {old_state.name} → {new_state.name}")
+        logger.info(f"状态变化: {old_state.name} → {new_state.name}, "
+                   f"status_window={self.status_window is not None}")
+
+        if self.status_window:
+            logger.info(f"[调试] status_window.window={self.status_window.window is not None}")
 
         # 更新菜单栏图标
         if new_state == State.RECORDING:
             self.status_item.button().setTitle_("🔴")
             self.status_menu_item.setTitle_("录音中...")
             if self.status_window:
+                logger.info("[调试] 即将调用 status_window.show('正在录音...')")
                 self.status_window.show("正在录音...")
+            else:
+                logger.error("[调试] status_window 为 None，无法显示录音窗口！")
         elif new_state == State.ARMING:
             self.status_item.button().setTitle_("🟡")
             self.status_menu_item.setTitle_("正在初始化...")
             if self.status_window:
+                logger.info("[调试] 即将调用 status_window.show('正在初始化...')")
                 self.status_window.show("正在初始化...")
+            else:
+                logger.error("[调试] status_window 为 None，无法显示初始化窗口！")
         elif new_state == State.STOPPING:
             self.status_item.button().setTitle_("🟠")
             self.status_menu_item.setTitle_("正在处理...")
@@ -262,12 +275,17 @@ class StatusBarController(NSObject):
 
     def _on_ui_update(self, text: Optional[str]):
         """UI 更新回调"""
+        logger.info(f"[调试] _on_ui_update 被调用, text={text[:30] if text else 'None'}..., "
+                   f"status_window={self.status_window is not None}")
         if text is None:
             if self.status_window:
                 self.status_window.hide()
         else:
             if self.status_window:
+                logger.info(f"[调试] 即将调用 status_window.update()")
                 self.status_window.update(text)
+            else:
+                logger.error("[调试] _on_ui_update: status_window 为 None！")
 
     def _on_error(self, message: str):
         """错误回调"""

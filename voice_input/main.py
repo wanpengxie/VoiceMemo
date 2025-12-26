@@ -655,22 +655,62 @@ class StatusBar:
 
     def show(self, text: str = "🎤 录音中..."):
         """显示状态条（线程安全）"""
+        logger.info(f"[显示] show() 被调用, text={text[:20]}...")
         self._pending_action = ('show', text)
         # 同时尝试使用 AppHelper（菜单栏应用模式）
         try:
             from PyObjCTools import AppHelper
             AppHelper.callAfter(self._do_show, text)
-        except:
-            pass  # 非菜单栏模式，使用 process_pending
+            logger.info("[显示] 已调度 _do_show 到主线程")
+        except Exception as e:
+            logger.error(f"[显示] 调度 _do_show 失败: {e}")
 
     def _do_show(self, text: str):
         """执行显示"""
-        if self.window:
+        logger.info(f"[显示] _do_show 开始执行, window={self.window is not None}")
+
+        if not self.window:
+            logger.error("[显示] window 为 None，无法显示！")
+            return
+
+        try:
+            # 1. 设置文本
             clean_text = text.replace("🎤 ", "").replace("❌ ", "").replace("✅ ", "")
             self.text_field.setStringValue_(clean_text)
+            logger.info(f"[显示] 文本已设置: {clean_text[:30]}...")
+
+            # 2. 设置录音状态（动画）
             self._set_recording_state(True)
+
+            # 3. 获取当前所有屏幕信息
+            from AppKit import NSScreen
+            screens = NSScreen.screens()
+            logger.info(f"[显示] 当前屏幕数量: {len(screens)}")
+            for i, screen in enumerate(screens):
+                sf = screen.frame()
+                logger.info(f"[显示] 屏幕{i}: origin=({sf.origin.x}, {sf.origin.y}), "
+                           f"size=({sf.size.width}, {sf.size.height}), "
+                           f"是否主屏幕={screen == NSScreen.mainScreen()}")
+
+            # 4. 移动到光标位置
             self._move_to_cursor()
+
+            # 5. 显示窗口
             self.window.orderFrontRegardless()
+
+            # 6. 输出窗口最终状态
+            frame = self.window.frame()
+            level = self.window.level()
+            alpha = self.window.alphaValue()
+            is_visible = self.window.isVisible()
+            logger.info(f"[显示] 窗口状态: 位置=({frame.origin.x}, {frame.origin.y}), "
+                       f"大小=({frame.size.width}, {frame.size.height}), "
+                       f"层级={level}, 透明度={alpha}, 可见={is_visible}")
+
+        except Exception as e:
+            logger.error(f"[显示] _do_show 执行失败: {e}")
+            import traceback
+            traceback.print_exc()
 
     def update(self, text: str):
         """更新文字（线程安全）"""
