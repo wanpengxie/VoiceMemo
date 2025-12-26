@@ -104,10 +104,14 @@ class StatusBar:
             self.window.setBackgroundColor_(NSColor.clearColor())
             self.window.setIgnoresMouseEvents_(True)
             self.window.setHasShadow_(False)
+            # 窗口行为：支持所有空间、全屏应用、不随失焦隐藏
+            from AppKit import NSWindowCollectionBehaviorFullScreenAuxiliary
             self.window.setCollectionBehavior_(
                 NSWindowCollectionBehaviorCanJoinAllSpaces |
-                NSWindowCollectionBehaviorStationary
+                NSWindowCollectionBehaviorStationary |
+                NSWindowCollectionBehaviorFullScreenAuxiliary  # 支持在全屏 App 中显示
             )
+            self.window.setHidesOnDeactivate_(False)  # Accessory 应用失焦时不隐藏
 
             # ═══════════════════════════════════════════════════════════════
             # 气泡卡片
@@ -501,34 +505,54 @@ class StatusBar:
                     else:
                         # 极端情况：主屏幕中央
                         frame = NSScreen.mainScreen().frame()
-                        x = frame.size.width / 2 - window_width / 2
-                        y = frame.size.height / 2 - window_height / 2
+                        x = frame.origin.x + frame.size.width / 2 - window_width / 2
+                        y = frame.origin.y + frame.size.height / 2 - window_height / 2
                         logger.info(f"[定位] 使用主屏幕中央")
 
             # ═══════════════════════════════════════════════════════════════
-            # 边界检查：确保不超出屏幕
+            # 边界检查：找到目标点所在屏幕，确保不超出该屏幕
             # ═══════════════════════════════════════════════════════════════
-            screen = NSScreen.mainScreen()
-            screen_frame = screen.frame()
+            from AppKit import NSPointInRect, NSMakePoint
+
+            # 找到包含目标点的屏幕
+            target_point = NSMakePoint(x, y)
+            target_screen = None
+            for screen in NSScreen.screens():
+                if NSPointInRect(target_point, screen.frame()):
+                    target_screen = screen
+                    break
+
+            # 如果点不在任何屏幕内，使用主屏幕
+            if not target_screen:
+                target_screen = NSScreen.mainScreen()
+                logger.info(f"[定位] 目标点 ({x}, {y}) 不在任何屏幕内，使用主屏幕")
+
+            # 使用 visibleFrame 避开 Dock 和菜单栏
+            screen_frame = target_screen.visibleFrame()
+            # 屏幕边界（绝对坐标）
+            screen_min_x = screen_frame.origin.x
+            screen_max_x = screen_frame.origin.x + screen_frame.size.width
+            screen_min_y = screen_frame.origin.y
+            screen_max_y = screen_frame.origin.y + screen_frame.size.height
 
             # 右边界
-            if x + window_width > screen_frame.size.width:
-                x = screen_frame.size.width - window_width - 8
+            if x + window_width > screen_max_x:
+                x = screen_max_x - window_width - 8
 
             # 左边界
-            if x < 8:
-                x = 8
+            if x < screen_min_x + 8:
+                x = screen_min_x + 8
 
             # 下边界：如果下方空间不够，改为显示在光标上方
-            if y < 8:
+            if y < screen_min_y + 8:
                 if use_caret and caret_pos:
                     y = caret_pos[1] + caret_pos[3] + 4  # 光标上方
                 else:
-                    y = 8
+                    y = screen_min_y + 8
 
             # 上边界
-            if y + window_height > screen_frame.size.height:
-                y = screen_frame.size.height - window_height - 8
+            if y + window_height > screen_max_y:
+                y = screen_max_y - window_height - 8
 
             # 移动窗口
             self.window.setFrameOrigin_((x, y))
