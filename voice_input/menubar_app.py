@@ -58,7 +58,9 @@ class StatusBarController(NSObject):
         self.saved_clipboard = ""
 
         # 保持对动态菜单项的引用，防止被 Python GC 回收导致崩溃
-        self._dynamic_menu_items = []
+        # 注意：不能给 PyObjC 对象添加自定义属性，所以用单独的列表
+        self._history_menu_items = []
+        self._device_menu_items = []
 
         # 初始化录音协调器
         self.coordinator = RecordingCoordinator(
@@ -107,6 +109,12 @@ class StatusBarController(NSObject):
         )
         self.device_submenu = NSMenu.alloc().init()
         self.device_submenu.setDelegate_(self)
+        # 占位项：空子菜单在 macOS 上无法展开，需要有初始项
+        placeholder_device = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "加载中...", None, ""
+        )
+        placeholder_device.setEnabled_(False)
+        self.device_submenu.addItem_(placeholder_device)
         device_item.setSubmenu_(self.device_submenu)
         menu.addItem_(device_item)
         self._device_menu_item = device_item
@@ -119,6 +127,12 @@ class StatusBarController(NSObject):
         )
         self.history_submenu = NSMenu.alloc().init()
         self.history_submenu.setDelegate_(self)
+        # 占位项：空子菜单在 macOS 上无法展开，需要有初始项
+        placeholder_history = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "加载中...", None, ""
+        )
+        placeholder_history.setEnabled_(False)
+        self.history_submenu.addItem_(placeholder_history)
         history_item.setSubmenu_(self.history_submenu)
         menu.addItem_(history_item)
         self._history_menu_item = history_item
@@ -335,31 +349,38 @@ class StatusBarController(NSObject):
 
     def menuNeedsUpdate_(self, menu):
         """NSMenuDelegate: 菜单即将显示时更新"""
+        logger.info(f"[菜单] menuNeedsUpdate_ 被调用, menu={menu}")
         try:
             if hasattr(self, 'history_submenu') and menu == self.history_submenu:
+                logger.info("[菜单] 匹配到 history_submenu，开始更新")
                 self._updateHistoryMenu()
             elif hasattr(self, 'device_submenu') and menu == self.device_submenu:
+                logger.info("[菜单] 匹配到 device_submenu，开始更新")
                 self._updateDeviceMenu()
+            else:
+                logger.info(f"[菜单] 未匹配任何子菜单")
         except Exception as e:
             logger.error(f"更新菜单失败: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _updateHistoryMenu(self):
         """更新历史子菜单"""
         try:
+            logger.info("[菜单] _updateHistoryMenu 开始执行")
             self.history_submenu.removeAllItems()
-            # 清空旧的菜单项引用（历史菜单部分）
-            self._dynamic_menu_items = [item for item in self._dynamic_menu_items
-                                        if not getattr(item, '_is_history_item', False)]
+            # 清空旧的菜单项引用
+            self._history_menu_items = []
 
             recent_items = history_manager.get_recent(10)
+            logger.info(f"[菜单] 获取到 {len(recent_items) if recent_items else 0} 条历史记录")
 
             if not recent_items:
                 empty_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
                     "暂无历史记录", None, ""
                 )
                 empty_item.setEnabled_(False)
-                empty_item._is_history_item = True
-                self._dynamic_menu_items.append(empty_item)
+                self._history_menu_items.append(empty_item)
                 self.history_submenu.addItem_(empty_item)
                 return
 
@@ -371,8 +392,7 @@ class StatusBarController(NSObject):
                 )
                 menu_item.setTarget_(self)
                 menu_item.setTag_(i)  # 用 tag 存储索引
-                menu_item._is_history_item = True
-                self._dynamic_menu_items.append(menu_item)
+                self._history_menu_items.append(menu_item)
                 self.history_submenu.addItem_(menu_item)
 
             # 如果有更多历史
@@ -384,8 +404,7 @@ class StatusBarController(NSObject):
                     f"查看更多... ({total_count} 条)", "showAllHistory:", ""
                 )
                 more_item.setTarget_(self)
-                more_item._is_history_item = True
-                self._dynamic_menu_items.append(more_item)
+                self._history_menu_items.append(more_item)
                 self.history_submenu.addItem_(more_item)
 
         except Exception as e:
@@ -419,23 +438,23 @@ class StatusBarController(NSObject):
     def _updateDeviceMenu(self):
         """更新设备子菜单"""
         try:
+            logger.info("[菜单] _updateDeviceMenu 开始执行")
             self.device_submenu.removeAllItems()
-            # 清空旧的菜单项引用（设备菜单部分）
-            self._dynamic_menu_items = [item for item in self._dynamic_menu_items
-                                        if not getattr(item, '_is_device_item', False)]
+            # 清空旧的菜单项引用
+            self._device_menu_items = []
 
             device_manager = get_device_manager()
             # 强制刷新设备列表（菜单打开时不会录音，可以安全刷新 PortAudio）
             device_manager.refresh_devices(force_refresh=True)
             devices = device_manager.get_devices()
+            logger.info(f"[菜单] 获取到 {len(devices) if devices else 0} 个音频设备")
 
             if not devices:
                 empty_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
                     "未检测到音频输入设备", None, ""
                 )
                 empty_item.setEnabled_(False)
-                empty_item._is_device_item = True
-                self._dynamic_menu_items.append(empty_item)
+                self._device_menu_items.append(empty_item)
                 self.device_submenu.addItem_(empty_item)
                 return
 
@@ -447,8 +466,7 @@ class StatusBarController(NSObject):
             auto_item.setTag_(-1)  # -1 表示自动选择
             if device_manager.is_auto_select():
                 auto_item.setState_(1)  # NSOnState = 1
-            auto_item._is_device_item = True
-            self._dynamic_menu_items.append(auto_item)
+            self._device_menu_items.append(auto_item)
             self.device_submenu.addItem_(auto_item)
 
             self.device_submenu.addItem_(NSMenuItem.separatorItem())
@@ -473,8 +491,7 @@ class StatusBarController(NSObject):
                 if not device_manager.is_auto_select() and selected_device and device.id == selected_device.id:
                     menu_item.setState_(1)  # NSOnState
 
-                menu_item._is_device_item = True
-                self._dynamic_menu_items.append(menu_item)
+                self._device_menu_items.append(menu_item)
                 self.device_submenu.addItem_(menu_item)
 
             # 刷新按钮
@@ -483,8 +500,7 @@ class StatusBarController(NSObject):
                 "刷新设备列表", "refreshDevices:", ""
             )
             refresh_item.setTarget_(self)
-            refresh_item._is_device_item = True
-            self._dynamic_menu_items.append(refresh_item)
+            self._device_menu_items.append(refresh_item)
             self.device_submenu.addItem_(refresh_item)
 
         except Exception as e:

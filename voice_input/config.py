@@ -42,6 +42,10 @@ AUDIO_BITS = 16
 AUDIO_CHANNEL = 1
 CHUNK_DURATION_MS = 100
 
+# 静音检测配置
+SILENCE_THRESHOLD = 500       # 静音阈值（RMS 能量值，低于此值视为静音）
+SILENCE_TIMEOUT_S = 60.0      # 静音超时时间（秒），持续静音超过此时间自动停止
+
 
 def get_app_key() -> str:
     """获取 App Key"""

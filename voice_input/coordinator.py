@@ -15,6 +15,8 @@ from queue import Queue
 from typing import Callable, Optional, Any
 from dataclasses import dataclass
 
+import numpy as np
+
 from .state_machine import (
     State, StateContext, StateMachine,
     Event, EventType, Effect, EffectType
@@ -28,6 +30,7 @@ from .system_utils import (
     check_network_reachable, get_system_event_listener,
     friendly_error_message, open_microphone_settings
 )
+from . import config
 
 logger = logging.getLogger(__name__)
 
@@ -78,10 +81,14 @@ class RecordingCoordinator:
 
         # 计时器
         self._flush_timer: Optional[threading.Timer] = None
-        self._recording_timeout_timer: Optional[threading.Timer] = None
+        self._silence_check_timer: Optional[threading.Timer] = None  # 静音检测定时器
         self._idle_timer: Optional[threading.Timer] = None
         self._arming_timeout_timer: Optional[threading.Timer] = None
         self._error_recover_timer: Optional[threading.Timer] = None
+
+        # 静音检测（时间戳方案）
+        self._last_voice_time: float = 0.0  # 最后检测到声音的时间
+        self._silence_check_session: Optional[str] = None  # 静音检测绑定的会话
 
         # 系统事件监听
         self._system_listener = get_system_event_listener()
@@ -131,7 +138,7 @@ class RecordingCoordinator:
 
         # 取消所有计时器
         self._cancel_timer(self._flush_timer)
-        self._cancel_timer(self._recording_timeout_timer)
+        self._cancel_timer(self._silence_check_timer)
         self._cancel_timer(self._idle_timer)
         self._cancel_timer(self._arming_timeout_timer)
         self._cancel_timer(self._error_recover_timer)
@@ -428,14 +435,15 @@ class RecordingCoordinator:
             send_callback=self._send_audio_to_asr
         )
 
-        # 启动录音超时保护（60 秒）
-        self._arm_recording_timeout(60.0)
+        # 启动静音超时保护（持续静音超过指定时间自动停止）
+        self._arm_silence_timeout(config.SILENCE_TIMEOUT_S)
 
         logger.info(f"音频采集已启动, session={session_id[:8]}")
 
     def _stop_capture(self):
         """停止音频采集"""
-        self._cancel_timer(self._recording_timeout_timer)
+        self._cancel_timer(self._silence_check_timer)
+        self._silence_check_session = None
 
         with self._resource_lock:
             recorder = self._recorder
@@ -511,6 +519,19 @@ class RecordingCoordinator:
         # ARMING 或 RECORDING 状态都接收音频
         if state == State.ARMING or state == State.RECORDING:
             self._audio_queue.put(data, session_id)
+
+            # 在 RECORDING 状态下检测音频能量，有声音时更新时间戳
+            if state == State.RECORDING and len(data) >= 2 and len(data) % 2 == 0:
+                try:
+                    # 将 PCM bytes 转换为 int16 数组计算能量
+                    audio_array = np.frombuffer(data, dtype=np.int16)
+                    # 使用均方根 (RMS) 作为能量指标
+                    rms = np.sqrt(np.mean(audio_array.astype(np.float32) ** 2))
+                    if rms > config.SILENCE_THRESHOLD:
+                        # 检测到声音，更新最后说话时间
+                        self._last_voice_time = time.monotonic()
+                except Exception as e:
+                    logger.debug(f"音频能量检测异常: {e}")
         # 其他状态（IDLE, STOPPING, ERROR）丢弃
 
     def _send_audio_to_asr(self, pcm: bytes) -> bool:
@@ -589,17 +610,43 @@ class RecordingCoordinator:
         self._flush_timer.daemon = True
         self._flush_timer.start()
 
-    def _arm_recording_timeout(self, timeout_s: float):
-        """设置录音超时（避免忘记松开 Option）"""
-        self._cancel_timer(self._recording_timeout_timer)
+    def _arm_silence_timeout(self, timeout_s: float):
+        """启动静音检测（基于时间戳方案，定期检查是否超时）"""
+        self._cancel_timer(self._silence_check_timer)
 
-        def on_timeout():
-            logger.warning(f"录音超时 ({timeout_s}s)，自动停止")
-            self.post_event(Event(EventType.U_STOP))
+        # 绑定当前会话，防止误停新会话
+        captured_session = self._ctx.session_id
+        self._silence_check_session = captured_session
 
-        self._recording_timeout_timer = threading.Timer(timeout_s, on_timeout)
-        self._recording_timeout_timer.daemon = True
-        self._recording_timeout_timer.start()
+        # 初始化最后说话时间
+        self._last_voice_time = time.monotonic()
+
+        def check_silence():
+            # 会话已变化，不处理
+            if self._silence_check_session != captured_session:
+                return
+
+            # 检查是否仍在 RECORDING 状态
+            if self._ctx.state != State.RECORDING:
+                return
+
+            now = time.monotonic()
+            silent_duration = now - self._last_voice_time
+
+            if silent_duration >= timeout_s:
+                # 静音超时，触发停止
+                logger.warning(f"静音超时 ({silent_duration:.1f}s >= {timeout_s}s)，自动停止")
+                self.post_event(Event(EventType.U_STOP, session_id=captured_session))
+            else:
+                # 未超时，继续定期检查（每秒检查一次）
+                self._silence_check_timer = threading.Timer(1.0, check_silence)
+                self._silence_check_timer.daemon = True
+                self._silence_check_timer.start()
+
+        # 启动定期检查（1秒后开始第一次检查）
+        self._silence_check_timer = threading.Timer(1.0, check_silence)
+        self._silence_check_timer.daemon = True
+        self._silence_check_timer.start()
 
     def _reset_idle_timer(self):
         """重置空闲检测计时器"""
