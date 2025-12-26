@@ -892,7 +892,7 @@ class StatusBar:
             self._do_hide()
 
 
-class VoiceInputApp:
+class VoiceMemoApp:
     """语音输入应用"""
 
     def __init__(self):
@@ -1127,7 +1127,7 @@ class VoiceInputApp:
 
 def main():
     """入口"""
-    app = VoiceInputApp()
+    app = VoiceMemoApp()
     app.run()
 
 

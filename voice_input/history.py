@@ -1,7 +1,7 @@
 """
 输入历史记录管理
 - 保存最近 100 条识别结果
-- 持久化存储到 ~/Library/Application Support/VoiceInput/history.json
+- 持久化存储到 ~/Library/Application Support/VoiceMemo/history.json
 """
 
 import json
@@ -14,7 +14,7 @@ from dataclasses import dataclass, asdict
 logger = logging.getLogger(__name__)
 
 # 应用数据目录
-APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "VoiceInput"
+APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "VoiceMemo"
 HISTORY_FILE = APP_SUPPORT_DIR / "history.json"
 
 # 历史记录限制

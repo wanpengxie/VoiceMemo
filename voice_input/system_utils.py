@@ -419,7 +419,7 @@ _pid_file_path = None
 _pid_file_handle = None  # 保持文件句柄，防止 GC 释放锁
 
 
-def ensure_single_instance(app_name: str = "VoiceInput") -> bool:
+def ensure_single_instance(app_name: str = "VoiceMemo") -> bool:
     """
     确保只有一个应用实例在运行
     Returns:
