@@ -1,4 +1,4 @@
-# VoiceInput 鲁棒性分析报告
+# VoiceMemo 鲁棒性分析报告
 
 ## 问题汇总
 
@@ -68,7 +68,7 @@
 ### P3 - 一般问题（边缘情况）
 
 #### 10. 多实例冲突
-- **现状**：可以同时运行多个 VoiceInput 实例
+- **现状**：可以同时运行多个 VoiceMemo 实例
 - **表现**：按键监听冲突、麦克风争用
 - **修复**：使用 PID 文件或 NSDistributedNotificationCenter 检测
 
