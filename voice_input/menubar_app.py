@@ -38,7 +38,7 @@ from .system_utils import (
 )
 from .audio_device_manager import get_device_manager
 
-# 配置日志（保存到 ~/Library/Logs/VoiceMemo/）
+# 配置日志（保存到 ~/Library/Logs/VoiceFlow/）
 setup_logging(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -557,7 +557,7 @@ class MenuBarApp:
         # 单实例检测
         if not ensure_single_instance():
             logger.warning("已有另一个实例在运行")
-            print("VoiceMemo 已在运行中！")
+            print("VoiceFlow 已在运行中！")
             return
 
         # 创建应用

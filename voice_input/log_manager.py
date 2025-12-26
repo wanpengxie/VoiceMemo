@@ -1,7 +1,7 @@
 """
 日志管理模块
 - 统一日志配置
-- 日志保存到 ~/Library/Logs/VoiceMemo/
+- 日志保存到 ~/Library/Logs/VoiceFlow/
 """
 
 import logging
@@ -11,7 +11,7 @@ from pathlib import Path
 
 
 # 应用名称
-APP_NAME = "VoiceMemo"
+APP_NAME = "VoiceFlow"
 
 # 日志目录 (macOS 标准应用日志目录)
 LOG_DIR = Path.home() / "Library" / "Logs" / APP_NAME

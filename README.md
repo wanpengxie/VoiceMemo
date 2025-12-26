@@ -1,4 +1,4 @@
-# VoiceMemo
+# VoiceFlow
 
 macOS 语音输入助手，按住 Option 键说话，松开自动输入文字。基于豆包（火山引擎）语音识别 API。
 
@@ -21,8 +21,8 @@ macOS 语音输入助手，按住 Option 键说话，松开自动输入文字。
 ### 1. 克隆项目
 
 ```bash
-git clone git@github.com:wanpengxie/VoiceMemo.git
-cd VoiceMemo
+git clone git@github.com:wanpengxie/VoiceFlow.git
+cd VoiceFlow
 ```
 
 ### 2. 安装依赖
@@ -81,18 +81,18 @@ rm -rf build dist
 python setup.py py2app
 ```
 
-打包完成后，应用位于 `dist/VoiceMemo.app`
+打包完成后，应用位于 `dist/VoiceFlow.app`
 
 ### 安装应用
 
 ```bash
 # 复制到应用程序目录
-cp -r dist/VoiceMemo.app /Applications/
+cp -r dist/VoiceFlow.app /Applications/
 ```
 
 ## macOS 权限设置
 
-VoiceMemo 需要以下系统权限才能正常工作：
+VoiceFlow 需要以下系统权限才能正常工作：
 
 ### 1. 麦克风权限（必需）
 
@@ -109,7 +109,7 @@ VoiceMemo 需要以下系统权限才能正常工作：
 1. 打开「系统设置」
 2. 点击「隐私与安全性」
 3. 点击「麦克风」
-4. 找到 VoiceMemo（或终端/IDE，如果是开发模式）
+4. 找到 VoiceFlow（或终端/IDE，如果是开发模式）
 5. 开启开关
 
 ### 2. 辅助功能权限（必需）
@@ -127,7 +127,7 @@ VoiceMemo 需要以下系统权限才能正常工作：
 3. 点击「辅助功能」
 4. 点击左下角的锁图标，输入密码解锁
 5. 点击「+」按钮
-6. 选择 `VoiceMemo.app`（或开发模式下的终端/IDE）
+6. 选择 `VoiceFlow.app`（或开发模式下的终端/IDE）
 7. 确保开关已开启
 
 > **注意：** 如果修改权限后仍不生效，尝试：
@@ -178,8 +178,8 @@ VoiceMemo 需要以下系统权限才能正常工作：
 
 | 数据类型 | 存储路径 |
 |----------|----------|
-| 日志文件 | `~/Library/Logs/VoiceMemo/` |
-| 历史记录 | `~/Library/Application Support/VoiceMemo/` |
+| 日志文件 | `~/Library/Logs/VoiceFlow/` |
+| 历史记录 | `~/Library/Application Support/VoiceFlow/` |
 | 用户设置 | macOS 系统偏好设置 (NSUserDefaults) |
 
 ## 常见问题
@@ -208,7 +208,7 @@ macOS 可能阻止未签名的应用：
 
 ```bash
 # 查看应用日志
-cat ~/Library/Logs/VoiceMemo/app.log
+cat ~/Library/Logs/VoiceFlow/app.log
 
 # 或通过菜单栏图标 → 查看日志
 ```
@@ -218,7 +218,7 @@ cat ~/Library/Logs/VoiceMemo/app.log
 ### 项目结构
 
 ```
-VoiceMemo/
+VoiceFlow/
 ├── voice_input/          # 核心模块
 │   ├── menubar_app.py    # 菜单栏应用主入口
 │   ├── asr_client.py     # 语音识别客户端

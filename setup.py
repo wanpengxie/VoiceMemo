@@ -16,9 +16,9 @@ DATA_FILES = []
 OPTIONS = {
     'argv_emulation': False,  # 禁用 argv 模拟，避免问题
     'plist': {
-        'CFBundleName': 'VoiceMemo',
+        'CFBundleName': 'VoiceFlow',
         'CFBundleDisplayName': '语音输入助手',
-        'CFBundleIdentifier': 'com.voicememo.app',
+        'CFBundleIdentifier': 'com.voiceflow.app',
         'CFBundleVersion': '1.0.0',
         'CFBundleShortVersionString': '1.0',
         'LSUIElement': True,  # 菜单栏应用，不显示 Dock 图标
@@ -51,12 +51,12 @@ OPTIONS = {
         'scipy',
         'pandas',
     ],
-    'iconfile': 'VoiceMemo.icns',
+    'iconfile': 'VoiceFlow.icns',
 }
 
 setup(
     app=APP,
-    name='VoiceMemo',
+    name='VoiceFlow',
     data_files=DATA_FILES,
     options={'py2app': OPTIONS},
     setup_requires=['py2app'],
